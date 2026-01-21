@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -167,7 +168,14 @@ func (h *HybridLocker) Unlock(key string) error {
 		if err == nil {
 			return nil
 		}
-		// If Redis unlock fails (e.g., key not found or value mismatch), try local unlock
+		// If Redis unlock fails due to lock value mismatch or lock expired,
+		// we should return the error instead of falling back to local lock
+		// Only fall back to local lock for connection/network errors
+		errStr := err.Error()
+		if strings.Contains(errStr, "lock value mismatch") || strings.Contains(errStr, "lock has expired") {
+			return err
+		}
+		// For other errors (e.g., connection failures), try local unlock
 	}
 
 	// Fall back to local lock
