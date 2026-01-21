@@ -11,7 +11,7 @@ import (
 
 func TestNewRedisLocker(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	locker := NewRedisLocker(client)
 	if locker == nil {
@@ -27,7 +27,7 @@ func TestNewRedisLocker(t *testing.T) {
 
 func TestNewRedisLockerWithLockTime(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	customLockTime := 30 * time.Second
 	locker := NewRedisLockerWithLockTime(client, customLockTime)
@@ -60,7 +60,7 @@ func TestGenerateLockValue(t *testing.T) {
 func TestRedisLocker_Lock(t *testing.T) {
 	t.Run("successful lock acquisition", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "test-lock"
@@ -76,7 +76,7 @@ func TestRedisLocker_Lock(t *testing.T) {
 
 	t.Run("lock already held", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "test-lock"
@@ -114,7 +114,7 @@ func TestRedisLocker_Lock(t *testing.T) {
 
 	t.Run("different keys can be locked independently", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 
@@ -138,7 +138,7 @@ func TestRedisLocker_Lock(t *testing.T) {
 
 	t.Run("Redis operation failure", func(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		mock.SetShouldFail(true)
@@ -155,7 +155,7 @@ func TestRedisLocker_Lock(t *testing.T) {
 func TestRedisLocker_Unlock(t *testing.T) {
 	t.Run("successful unlock", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "test-lock"
@@ -181,7 +181,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 	t.Run("lock value mismatch", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker1 := NewRedisLocker(client)
 		locker2 := NewRedisLocker(client)
@@ -221,7 +221,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 	t.Run("unlock non-existent lock (backward compatibility)", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "non-existent-lock"
@@ -236,7 +236,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 	t.Run("unlock expired lock", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLockerWithLockTime(client, 50*time.Millisecond)
 		key := "expired-lock"
@@ -256,7 +256,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 	t.Run("unlock with Redis operation failure", func(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "test-lock"
@@ -281,7 +281,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 func TestHybridLocker(t *testing.T) {
 	t.Run("creates hybrid locker with Redis", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewHybridLocker(client)
 		if locker == nil {
@@ -310,7 +310,7 @@ func TestHybridLocker(t *testing.T) {
 
 	t.Run("uses Redis lock when available", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewHybridLocker(client)
 		key := "test-lock"
@@ -335,7 +335,7 @@ func TestHybridLocker(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewHybridLocker(client)
 		key := "test-lock"
@@ -376,7 +376,7 @@ func TestHybridLocker(t *testing.T) {
 
 	t.Run("concurrent hybrid lock", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewHybridLocker(client)
 		key := "concurrent-lock"
@@ -408,7 +408,7 @@ func TestHybridLocker(t *testing.T) {
 
 	t.Run("hybrid unlock with Redis error falls back to local", func(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewHybridLocker(client)
 		key := "test-lock"
@@ -429,7 +429,7 @@ func TestHybridLocker(t *testing.T) {
 func TestRedisLocker_Concurrent(t *testing.T) {
 	t.Run("concurrent lock contention", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		locker := NewRedisLocker(client)
 		key := "concurrent-key"

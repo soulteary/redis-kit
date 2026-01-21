@@ -25,7 +25,7 @@ func TestWithTimeout(t *testing.T) {
 	})
 
 	t.Run("handles nil context", func(t *testing.T) {
-		ctx, cancel := WithTimeout(nil, 100*time.Millisecond)
+		ctx, cancel := WithTimeout(context.TODO(), 100*time.Millisecond)
 		defer cancel()
 
 		if ctx == nil {
@@ -77,7 +77,7 @@ func TestWithDefaultTimeout(t *testing.T) {
 	})
 
 	t.Run("handles nil context", func(t *testing.T) {
-		ctx, cancel := WithDefaultTimeout(nil)
+		ctx, cancel := WithDefaultTimeout(context.TODO())
 		defer cancel()
 
 		if ctx == nil {

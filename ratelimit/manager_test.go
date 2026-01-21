@@ -11,7 +11,7 @@ import (
 
 func TestNewRateLimiter(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	limiter := NewRateLimiter(client)
 	if limiter == nil {
@@ -30,7 +30,7 @@ func TestNewRateLimiter(t *testing.T) {
 
 func TestNewRateLimiterWithPrefixes(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	keyPrefix := "custom:"
 	cooldownPrefix := "cooldown:"
@@ -49,7 +49,7 @@ func TestNewRateLimiterWithPrefixes(t *testing.T) {
 func TestRateLimiter_CheckLimit(t *testing.T) {
 	t.Run("first request allowed", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -71,7 +71,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("within limit", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -97,7 +97,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("limit exceeded", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -125,7 +125,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("boundary condition limit equals count", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -147,7 +147,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("limit equals one", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -188,7 +188,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("reset time calculation", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -214,7 +214,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("remaining count negative protection", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -246,7 +246,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 
 	t.Run("expiration handling for existing key", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -274,7 +274,7 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 func TestRateLimiter_CheckCooldown(t *testing.T) {
 	t.Run("cooldown not active", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -293,7 +293,7 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 
 	t.Run("cooldown active", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -336,7 +336,7 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 
 	t.Run("reset time calculation", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -362,7 +362,7 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 
 	t.Run("remaining count negative protection", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -394,7 +394,7 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 
 	t.Run("expiration handling for existing key", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -421,7 +421,7 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 
 func TestRateLimiter_CheckUserLimit(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	limiter := NewRateLimiter(client)
 	ctx := context.Background()
@@ -449,7 +449,7 @@ func TestRateLimiter_CheckUserLimit(t *testing.T) {
 
 func TestRateLimiter_CheckIPLimit(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	limiter := NewRateLimiter(client)
 	ctx := context.Background()
@@ -471,7 +471,7 @@ func TestRateLimiter_CheckIPLimit(t *testing.T) {
 
 func TestRateLimiter_CheckDestinationLimit(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	limiter := NewRateLimiter(client)
 	ctx := context.Background()
@@ -494,7 +494,7 @@ func TestRateLimiter_CheckDestinationLimit(t *testing.T) {
 func TestRateLimiter_Concurrent(t *testing.T) {
 	t.Run("concurrent limit checks", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -542,7 +542,7 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 
 	t.Run("concurrent cooldown checks", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
@@ -590,7 +590,7 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 
 func TestRateLimiter_KeyPrefixes(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	limiter := NewRateLimiterWithPrefixes(client, "custom:", "custom-cooldown:")
 	ctx := context.Background()

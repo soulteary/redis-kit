@@ -12,7 +12,7 @@ import (
 func TestCheckHealth(t *testing.T) {
 	t.Run("healthy status", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		status := CheckHealth(ctx, client)
@@ -53,7 +53,7 @@ func TestCheckHealth(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
@@ -76,7 +76,7 @@ func TestCheckHealth(t *testing.T) {
 
 	t.Run("latency measurement", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		status := CheckHealth(ctx, client)
@@ -92,7 +92,7 @@ func TestCheckHealth(t *testing.T) {
 
 	t.Run("timestamp recording", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		before := time.Now()
 		ctx := context.Background()

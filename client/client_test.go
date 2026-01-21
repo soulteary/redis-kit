@@ -12,7 +12,7 @@ import (
 func TestNewClient(t *testing.T) {
 	t.Run("successful creation with mock", func(t *testing.T) {
 		mockClient, _ := testutil.NewMockRedisClient()
-		defer mockClient.Close()
+		defer func() { _ = mockClient.Close() }()
 
 		cfg := DefaultConfig().WithAddr("mock")
 		// We can't use NewClient with mock because it tries to ping
@@ -55,7 +55,7 @@ func TestNewClientWithDefaults(t *testing.T) {
 func TestPing(t *testing.T) {
 	t.Run("successful ping", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		err := Ping(ctx, client)
@@ -80,7 +80,7 @@ func TestPing(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
@@ -112,7 +112,7 @@ func TestClose(t *testing.T) {
 func TestHealthCheck(t *testing.T) {
 	t.Run("healthy client", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		healthy := HealthCheck(ctx, client)
@@ -133,7 +133,7 @@ func TestHealthCheck(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
@@ -152,7 +152,7 @@ func TestHealthCheck(t *testing.T) {
 			ReadTimeout:  10 * time.Millisecond,
 			WriteTimeout: 10 * time.Millisecond,
 		})
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
@@ -165,7 +165,7 @@ func TestHealthCheck(t *testing.T) {
 
 	t.Run("context cancellation", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // Cancel immediately

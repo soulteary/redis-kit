@@ -50,7 +50,7 @@ func (m *MockRedis) dialer(_ context.Context, _, _ string) (net.Conn, error) {
 
 // serveConn handles connections to the mock Redis
 func (m *MockRedis) serveConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)

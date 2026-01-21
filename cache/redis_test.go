@@ -10,7 +10,7 @@ import (
 
 func TestNewCache(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	c := NewCache(client, "test:")
 	if c == nil {
@@ -27,7 +27,7 @@ func TestNewCache(t *testing.T) {
 func TestRedisCache_buildKey(t *testing.T) {
 	t.Run("with prefix", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		key := c.buildKey("mykey")
@@ -39,7 +39,7 @@ func TestRedisCache_buildKey(t *testing.T) {
 
 	t.Run("without prefix", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "")
 		key := c.buildKey("mykey")
@@ -53,7 +53,7 @@ func TestRedisCache_buildKey(t *testing.T) {
 func TestRedisCache_Set(t *testing.T) {
 	t.Run("successful set", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -82,7 +82,7 @@ func TestRedisCache_Set(t *testing.T) {
 
 	t.Run("complex type serialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -102,7 +102,7 @@ func TestRedisCache_Set(t *testing.T) {
 
 	t.Run("slice serialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -116,7 +116,7 @@ func TestRedisCache_Set(t *testing.T) {
 
 	t.Run("map serialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -136,7 +136,7 @@ func TestRedisCache_Set(t *testing.T) {
 func TestRedisCache_Get(t *testing.T) {
 	t.Run("successful get", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -160,7 +160,7 @@ func TestRedisCache_Get(t *testing.T) {
 
 	t.Run("key not found", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -194,7 +194,7 @@ func TestRedisCache_Get(t *testing.T) {
 
 	t.Run("complex type deserialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -223,7 +223,7 @@ func TestRedisCache_Get(t *testing.T) {
 
 	t.Run("slice deserialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -248,7 +248,7 @@ func TestRedisCache_Get(t *testing.T) {
 func TestRedisCache_Del(t *testing.T) {
 	t.Run("successful delete", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -290,7 +290,7 @@ func TestRedisCache_Del(t *testing.T) {
 func TestRedisCache_Exists(t *testing.T) {
 	t.Run("key exists", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -310,7 +310,7 @@ func TestRedisCache_Exists(t *testing.T) {
 
 	t.Run("key does not exist", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -344,7 +344,7 @@ func TestRedisCache_Exists(t *testing.T) {
 func TestRedisCache_TTL(t *testing.T) {
 	t.Run("get TTL", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -366,7 +366,7 @@ func TestRedisCache_TTL(t *testing.T) {
 
 	t.Run("key does not exist", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -398,7 +398,7 @@ func TestRedisCache_TTL(t *testing.T) {
 func TestRedisCache_Expire(t *testing.T) {
 	t.Run("set expiration", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -442,7 +442,7 @@ func TestRedisCache_Expire(t *testing.T) {
 func TestRedisCache_KeyPrefix(t *testing.T) {
 	t.Run("prefix is applied", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "app:")
 		ctx := context.Background()
@@ -466,7 +466,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("different prefixes don't conflict", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c1 := NewCache(client, "app1:")
 		c2 := NewCache(client, "app2:")
@@ -491,7 +491,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("invalid JSON deserialization", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -517,7 +517,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("zero TTL", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -541,7 +541,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("empty value", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -565,7 +565,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("nil value handling", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		c := NewCache(client, "test:")
 		ctx := context.Background()
@@ -591,7 +591,7 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 
 	t.Run("buildKey edge cases", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		// Test with various prefix/key combinations
 		testCases := []struct {
