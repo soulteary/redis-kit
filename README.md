@@ -1,5 +1,9 @@
 # redis-kit
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/redis-kit.svg)](https://pkg.go.dev/github.com/soulteary/redis-kit)
+[![Go Report Card](https://goreportcard.com/badge/github.com/soulteary/redis-kit)](https://goreportcard.com/report/github.com/soulteary/redis-kit)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A unified Redis utility library for Go projects. This package provides common Redis operations including client management, distributed locking, rate limiting, and caching.
 
 ## Features
@@ -159,8 +163,152 @@ redis-kit/
 ├── lock/            # Distributed locking
 ├── ratelimit/       # Rate limiting
 ├── cache/           # Generic caching interface
-└── utils/           # Utility functions
+├── utils/           # Utility functions
+└── testutil/        # Testing utilities (mock Redis)
 ```
+
+## Requirements
+
+- Go 1.25 or later
+- Redis server (optional for testing, mock Redis is provided)
+
+## Testing
+
+The library includes comprehensive tests with mock Redis support, so you can run tests without a real Redis instance:
+
+```bash
+# Run all tests
+go test ./... -v
+
+# Run tests with coverage
+go test ./... -coverprofile=coverage.out -covermode=atomic
+
+# Generate HTML coverage report
+go tool cover -html=coverage.out -o coverage.html
+
+# View coverage summary
+go tool cover -func=coverage.out
+```
+
+See [COVERAGE.md](COVERAGE.md) for detailed coverage information.
+
+## Examples
+
+### Complete Example: Rate-Limited Cache with Locking
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+    
+    "github.com/soulteary/redis-kit/cache"
+    "github.com/soulteary/redis-kit/client"
+    "github.com/soulteary/redis-kit/lock"
+    "github.com/soulteary/redis-kit/ratelimit"
+)
+
+func main() {
+    ctx := context.Background()
+    
+    // Initialize Redis client
+    redisClient, err := client.NewClientWithDefaults("localhost:6379")
+    if err != nil {
+        panic(err)
+    }
+    defer redisClient.Close()
+    
+    // Health check
+    if !client.HealthCheck(ctx, redisClient) {
+        panic("Redis is not healthy")
+    }
+    
+    // Create cache
+    userCache := cache.NewCache(redisClient, "user:")
+    
+    // Create locker
+    locker := lock.NewHybridLocker(redisClient)
+    
+    // Create rate limiter
+    limiter := ratelimit.NewRateLimiter(redisClient)
+    
+    // Example: Get user with caching and rate limiting
+    userID := "user123"
+    
+    // Check rate limit
+    allowed, remaining, resetTime, err := limiter.CheckUserLimit(ctx, userID, 10, time.Hour)
+    if err != nil {
+        panic(err)
+    }
+    if !allowed {
+        fmt.Printf("Rate limit exceeded. Reset at: %v\n", resetTime)
+        return
+    }
+    fmt.Printf("Rate limit OK. Remaining: %d\n", remaining)
+    
+    // Try to acquire lock
+    lockKey := fmt.Sprintf("user:%s:lock", userID)
+    acquired, err := locker.Lock(lockKey)
+    if err != nil {
+        panic(err)
+    }
+    if !acquired {
+        fmt.Println("Could not acquire lock")
+        return
+    }
+    defer locker.Unlock(lockKey)
+    
+    // Check cache first
+    type User struct {
+        ID   string
+        Name string
+    }
+    var user User
+    exists, err := userCache.Exists(ctx, userID)
+    if err != nil {
+        panic(err)
+    }
+    
+    if exists {
+        // Cache hit
+        err = userCache.Get(ctx, userID, &user)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("Cache hit: %+v\n", user)
+    } else {
+        // Cache miss - fetch from database
+        user = User{ID: userID, Name: "Alice"}
+        
+        // Store in cache
+        err = userCache.Set(ctx, userID, user, 1*time.Hour)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Printf("Cached: %+v\n", user)
+    }
+}
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Development Guidelines
+
+- Follow Go best practices and conventions
+- Add tests for new features
+- Ensure all tests pass (`go test ./...`)
+- Run `go fmt` and `go vet` before committing
+- Update documentation as needed
 
 ## License
 
