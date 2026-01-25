@@ -26,6 +26,7 @@ func TestWithTimeout(t *testing.T) {
 
 	t.Run("handles nil context", func(t *testing.T) {
 		// Pass nil explicitly to test the nil check branch
+		//nolint:staticcheck // SA1012: intentionally passing nil to test nil handling
 		ctx, cancel := WithTimeout(nil, 100*time.Millisecond)
 		defer cancel()
 
@@ -111,6 +112,7 @@ func TestWithDefaultTimeout(t *testing.T) {
 
 	t.Run("handles nil context", func(t *testing.T) {
 		// Pass nil explicitly to test the nil check branch
+		//nolint:staticcheck // SA1012: intentionally passing nil to test nil handling
 		ctx, cancel := WithDefaultTimeout(nil)
 		defer cancel()
 
