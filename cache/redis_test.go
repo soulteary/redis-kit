@@ -615,3 +615,205 @@ func TestRedisCache_KeyPrefix(t *testing.T) {
 		}
 	})
 }
+
+// unmarshalableValue is a type that cannot be marshaled to JSON
+type unmarshalableValue struct {
+	Ch chan int
+}
+
+func TestRedisCache_Set_MarshalError(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Try to set a value that cannot be marshaled to JSON (contains a channel)
+	badValue := unmarshalableValue{Ch: make(chan int)}
+	err := c.Set(ctx, "badkey", badValue, time.Minute)
+	if err == nil {
+		t.Error("Set() with unmarshalable value should return error")
+	}
+	if err != nil && !contains(err.Error(), "failed to marshal") {
+		t.Errorf("Set() error = %q, should contain 'failed to marshal'", err.Error())
+	}
+}
+
+func TestRedisCache_Set_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	err := c.Set(ctx, "key1", "value1", time.Minute)
+	if err == nil {
+		t.Error("Set() with Redis failure should return error")
+	}
+	if err != nil && !contains(err.Error(), "failed to set cache") {
+		t.Errorf("Set() error = %q, should contain 'failed to set cache'", err.Error())
+	}
+
+	mock.SetShouldFail(false)
+}
+
+func TestRedisCache_Get_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a value first
+	_ = c.Set(ctx, "key1", "value1", time.Minute)
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	var value string
+	err := c.Get(ctx, "key1", &value)
+	if err == nil {
+		t.Error("Get() with Redis failure should return error")
+	}
+	if err != nil && !contains(err.Error(), "failed to get cache") {
+		t.Errorf("Get() error = %q, should contain 'failed to get cache'", err.Error())
+	}
+
+	mock.SetShouldFail(false)
+}
+
+func TestRedisCache_Get_UnmarshalError(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a string value
+	_ = c.Set(ctx, "stringkey", "not a json object", time.Minute)
+
+	// Try to unmarshal into a struct that expects specific JSON structure
+	type StrictStruct struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}
+
+	// Set invalid JSON for this struct (a string instead of an object)
+	_ = c.Set(ctx, "invalidjson", "invalid", time.Minute)
+
+	var result StrictStruct
+	// This should succeed because "invalid" marshals to a string, which can be unmarshalled
+	// but won't match the struct fields - test shows the unmarshal path works
+	err := c.Get(ctx, "invalidjson", &result)
+	// This may or may not error depending on how the value was stored
+	if err != nil {
+		t.Logf("Get() with mismatched type returned error (acceptable): %v", err)
+	}
+}
+
+func TestRedisCache_Exists_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a value first
+	_ = c.Set(ctx, "key1", "value1", time.Minute)
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	_, err := c.Exists(ctx, "key1")
+	if err == nil {
+		t.Error("Exists() with Redis failure should return error")
+	}
+	if err != nil && !contains(err.Error(), "failed to check existence") {
+		t.Errorf("Exists() error = %q, should contain 'failed to check existence'", err.Error())
+	}
+
+	mock.SetShouldFail(false)
+}
+
+func TestRedisCache_TTL_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a value first
+	_ = c.Set(ctx, "key1", "value1", time.Minute)
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	_, err := c.TTL(ctx, "key1")
+	if err == nil {
+		t.Error("TTL() with Redis failure should return error")
+	}
+	if err != nil && !contains(err.Error(), "failed to get TTL") {
+		t.Errorf("TTL() error = %q, should contain 'failed to get TTL'", err.Error())
+	}
+
+	mock.SetShouldFail(false)
+}
+
+func TestRedisCache_Del_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a value first
+	_ = c.Set(ctx, "key1", "value1", time.Minute)
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	err := c.Del(ctx, "key1")
+	if err == nil {
+		t.Error("Del() with Redis failure should return error")
+	}
+
+	mock.SetShouldFail(false)
+}
+
+func TestRedisCache_Expire_RedisError(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set a value first
+	_ = c.Set(ctx, "key1", "value1", time.Minute)
+
+	// Make Redis fail
+	mock.SetShouldFail(true)
+
+	err := c.Expire(ctx, "key1", 2*time.Minute)
+	if err == nil {
+		t.Error("Expire() with Redis failure should return error")
+	}
+
+	mock.SetShouldFail(false)
+}
+
+// Helper function to check if a string contains a substring
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

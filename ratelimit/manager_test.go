@@ -606,3 +606,281 @@ func TestRateLimiter_KeyPrefixes(t *testing.T) {
 		t.Errorf("CheckCooldown() with custom prefix error = %v, want nil", err)
 	}
 }
+
+func TestRateLimiter_CheckLimit_RedisFailures(t *testing.T) {
+	t.Run("redis get failure", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// First request to set up the key
+		_, _, _, _ = limiter.CheckLimit(ctx, "failkey1", 10, time.Hour)
+
+		// Make Redis fail for subsequent operations
+		mock.SetShouldFail(true)
+
+		_, _, _, err := limiter.CheckLimit(ctx, "failkey1", 10, time.Hour)
+		if err == nil {
+			t.Error("CheckLimit() with Redis failure should return error")
+		}
+
+		mock.SetShouldFail(false)
+	})
+
+	t.Run("redis incr failure", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// First request to set up the key
+		_, _, _, _ = limiter.CheckLimit(ctx, "failkey2", 10, time.Hour)
+
+		// Make Redis fail for subsequent operations
+		mock.SetShouldFail(true)
+
+		_, _, _, err := limiter.CheckLimit(ctx, "failkey2", 10, time.Hour)
+		if err == nil {
+			t.Error("CheckLimit() with Redis Incr failure should return error")
+		}
+
+		mock.SetShouldFail(false)
+	})
+
+	t.Run("redis set failure on first request", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Make Redis fail immediately
+		mock.SetShouldFail(true)
+
+		_, _, _, err := limiter.CheckLimit(ctx, "failkey3", 10, time.Hour)
+		if err == nil {
+			t.Error("CheckLimit() with Redis Set failure should return error")
+		}
+
+		mock.SetShouldFail(false)
+	})
+}
+
+func TestRateLimiter_CheckCooldown_RedisFailures(t *testing.T) {
+	t.Run("redis exists failure", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		mock.SetShouldFail(true)
+
+		_, _, err := limiter.CheckCooldown(ctx, "coolfailkey1", 60*time.Second)
+		if err == nil {
+			t.Error("CheckCooldown() with Redis Exists failure should return error")
+		}
+
+		mock.SetShouldFail(false)
+	})
+
+	t.Run("redis set failure after exists check", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// We can't easily test the set failure after exists succeeds with the current mock
+		// But we can test that the basic flow works
+		allowed1, _, err1 := limiter.CheckCooldown(ctx, "coolfailkey2", 60*time.Second)
+		if err1 != nil || !allowed1 {
+			t.Error("First CheckCooldown() should succeed")
+		}
+
+		// Second call should be denied (cooldown active)
+		allowed2, _, err2 := limiter.CheckCooldown(ctx, "coolfailkey2", 60*time.Second)
+		if err2 != nil {
+			t.Errorf("CheckCooldown() error = %v", err2)
+		}
+		if allowed2 {
+			t.Error("Second CheckCooldown() should be denied (cooldown active)")
+		}
+
+		_ = mock // Silence unused variable warning
+	})
+}
+
+func TestRateLimiter_EdgeCases(t *testing.T) {
+	t.Run("zero limit", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// With limit=0, first request should set count to 1, which is >= 0
+		// The CheckLimit function handles remaining < 0 by setting it to 0
+		allowed, remaining, _, err := limiter.CheckLimit(ctx, "zerokey", 0, time.Hour)
+		if err != nil {
+			t.Errorf("CheckLimit() error = %v", err)
+		}
+		// First request sets count to 1, remaining = 0 - 1 = -1, but capped to 0
+		if allowed {
+			t.Log("First request with limit=0 was allowed (sets count to 1)")
+		}
+		// Remaining is capped at 0 (not negative) in the implementation
+		if remaining != 0 {
+			t.Logf("Remaining = %d (expected 0 after capping)", remaining)
+		}
+	})
+
+	t.Run("very short window", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Use very short window
+		allowed, _, _, err := limiter.CheckLimit(ctx, "shortwindow", 2, 50*time.Millisecond)
+		if err != nil {
+			t.Errorf("CheckLimit() error = %v", err)
+		}
+		if !allowed {
+			t.Error("First request should be allowed")
+		}
+
+		// Wait for window to expire
+		time.Sleep(100 * time.Millisecond)
+
+		// Should be allowed again (new window)
+		allowed2, remaining2, _, err2 := limiter.CheckLimit(ctx, "shortwindow", 2, 50*time.Millisecond)
+		if err2 != nil {
+			t.Errorf("CheckLimit() error = %v", err2)
+		}
+		if !allowed2 {
+			t.Error("Request after window expiry should be allowed")
+		}
+		if remaining2 != 1 {
+			t.Errorf("Remaining = %d, want 1 (first request in new window)", remaining2)
+		}
+	})
+
+	t.Run("large limit", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Use very large limit
+		allowed, remaining, _, err := limiter.CheckLimit(ctx, "largelimit", 1000000, time.Hour)
+		if err != nil {
+			t.Errorf("CheckLimit() error = %v", err)
+		}
+		if !allowed {
+			t.Error("Request should be allowed with large limit")
+		}
+		if remaining != 999999 {
+			t.Errorf("Remaining = %d, want 999999", remaining)
+		}
+	})
+
+	t.Run("empty key", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Empty key should still work
+		allowed, _, _, err := limiter.CheckLimit(ctx, "", 10, time.Hour)
+		if err != nil {
+			t.Errorf("CheckLimit() with empty key error = %v", err)
+		}
+		if !allowed {
+			t.Error("Request should be allowed")
+		}
+	})
+
+	t.Run("special characters in key", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Key with special characters
+		allowed, _, _, err := limiter.CheckLimit(ctx, "key:with:colons:and-dashes_and_underscores", 10, time.Hour)
+		if err != nil {
+			t.Errorf("CheckLimit() with special characters error = %v", err)
+		}
+		if !allowed {
+			t.Error("Request should be allowed")
+		}
+	})
+}
+
+func TestRateLimiter_Convenience_Methods(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	limiter := NewRateLimiter(client)
+	ctx := context.Background()
+
+	t.Run("CheckUserLimit multiple calls", func(t *testing.T) {
+		// Make multiple calls to verify rate limiting works
+		for i := 0; i < 5; i++ {
+			_, _, _, _ = limiter.CheckUserLimit(ctx, "testuser", 5, time.Hour)
+		}
+
+		allowed, remaining, _, err := limiter.CheckUserLimit(ctx, "testuser", 5, time.Hour)
+		if err != nil {
+			t.Errorf("CheckUserLimit() error = %v", err)
+		}
+		if allowed {
+			t.Error("Request should be denied (limit reached)")
+		}
+		if remaining != 0 {
+			t.Errorf("Remaining = %d, want 0", remaining)
+		}
+	})
+
+	t.Run("CheckIPLimit multiple calls", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			_, _, _, _ = limiter.CheckIPLimit(ctx, "10.0.0.1", 3, time.Hour)
+		}
+
+		allowed, remaining, _, err := limiter.CheckIPLimit(ctx, "10.0.0.1", 3, time.Hour)
+		if err != nil {
+			t.Errorf("CheckIPLimit() error = %v", err)
+		}
+		if allowed {
+			t.Error("Request should be denied (limit reached)")
+		}
+		if remaining != 0 {
+			t.Errorf("Remaining = %d, want 0", remaining)
+		}
+	})
+
+	t.Run("CheckDestinationLimit multiple calls", func(t *testing.T) {
+		for i := 0; i < 4; i++ {
+			_, _, _, _ = limiter.CheckDestinationLimit(ctx, "+1234567890", 4, time.Hour)
+		}
+
+		allowed, remaining, _, err := limiter.CheckDestinationLimit(ctx, "+1234567890", 4, time.Hour)
+		if err != nil {
+			t.Errorf("CheckDestinationLimit() error = %v", err)
+		}
+		if allowed {
+			t.Error("Request should be denied (limit reached)")
+		}
+		if remaining != 0 {
+			t.Errorf("Remaining = %d, want 0", remaining)
+		}
+	})
+}

@@ -88,8 +88,6 @@ func (m *MockRedis) handleCommand(args []string, w *bufio.Writer) error {
 		return writeSimpleString(w, "PONG")
 	case "SET":
 		return m.handleSet(args, w)
-	case "SETNX":
-		return m.handleSetNX(args, w)
 	case "GET":
 		return m.handleGet(args, w)
 	case "DEL":
@@ -176,48 +174,6 @@ func (m *MockRedis) handleSet(args []string, w *bufio.Writer) error {
 	m.data[key] = mockValue{value: value, expiresAt: expiresAt}
 
 	return writeSimpleString(w, "OK")
-}
-
-func (m *MockRedis) handleSetNX(args []string, w *bufio.Writer) error {
-	// SetNX is typically called as SETNX key value, but go-redis uses SET key value NX EX seconds
-	// So we handle it via the SET command with NX option
-	// This function may not be called directly, but we keep it for compatibility
-	if len(args) < 3 {
-		return writeError(w, "invalid args")
-	}
-
-	key := args[1]
-	value := args[2]
-	ttl := time.Duration(0)
-
-	// If there's a 4th argument, it might be expiration
-	if len(args) >= 4 {
-		// Try to parse as duration or seconds
-		if seconds, err := strconv.Atoi(args[3]); err == nil {
-			ttl = time.Duration(seconds) * time.Second
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if key exists and not expired
-	val, exists := m.data[key]
-	if exists {
-		if val.expiresAt == nil || time.Now().Before(*val.expiresAt) {
-			return writeInt(w, 0)
-		}
-		// Key expired, treat as not existing
-		delete(m.data, key)
-	}
-
-	var expiresAt *time.Time
-	if ttl > 0 {
-		exp := time.Now().Add(ttl)
-		expiresAt = &exp
-	}
-	m.data[key] = mockValue{value: value, expiresAt: expiresAt}
-	return writeInt(w, 1)
 }
 
 func (m *MockRedis) handleGet(args []string, w *bufio.Writer) error {

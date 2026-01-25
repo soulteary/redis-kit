@@ -5,27 +5,27 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/redis-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/redis-kit)
 
-[中文文档](README_CN.md)
+[English](README.md)
 
-A unified Redis utility library for Go projects. This package provides common Redis operations including client management, distributed locking, rate limiting, and caching.
+一个统一的 Go Redis 工具库。提供常用的 Redis 操作，包括客户端管理、分布式锁、限流和缓存。
 
-## Features
+## 功能特性
 
-- **Client Management**: Unified Redis client initialization and configuration
-- **Distributed Locking**: Redis-based distributed locks with automatic fallback to local locks
-- **Rate Limiting**: Flexible rate limiting with support for user/IP/destination-based limits
-- **Caching**: Generic cache interface with Redis implementation
-- **Health Checks**: Built-in health check functionality
+- **客户端管理** - 统一的 Redis 客户端初始化和配置
+- **分布式锁** - 基于 Redis 的分布式锁，支持自动降级到本地锁
+- **限流器** - 灵活的限流功能，支持用户/IP/目标地址的限流
+- **缓存** - 通用缓存接口，提供 Redis 实现
+- **健康检查** - 内置健康检查功能
 
-## Installation
+## 安装
 
 ```bash
 go get github.com/soulteary/redis-kit
 ```
 
-## Usage
+## 快速开始
 
-### Client Management
+### 客户端管理
 
 ```go
 import (
@@ -33,14 +33,14 @@ import (
     "github.com/redis/go-redis/v9"
 )
 
-// Create a client with default configuration
+// 使用默认配置创建客户端
 client, err := client.NewClientWithDefaults("localhost:6379")
 if err != nil {
     log.Fatal(err)
 }
 defer client.Close(client)
 
-// Or use custom configuration
+// 或使用自定义配置
 cfg := client.DefaultConfig().
     WithAddr("localhost:6379").
     WithPassword("mypassword").
@@ -50,35 +50,35 @@ cfg := client.DefaultConfig().
 client, err := client.NewClient(cfg)
 ```
 
-### Distributed Locking
+### 分布式锁
 
 ```go
 import "github.com/soulteary/redis-kit/lock"
 
-// Create a Redis locker
+// 创建 Redis 锁
 locker := lock.NewRedisLocker(client)
 
-// Acquire a lock
+// 获取锁
 success, err := locker.Lock("my-lock-key")
 if err != nil {
     log.Fatal(err)
 }
 if !success {
-    log.Println("Lock already held")
+    log.Println("锁已被占用")
     return
 }
 
-// Do work...
+// 执行业务逻辑...
 
-// Release the lock
+// 释放锁
 defer locker.Unlock("my-lock-key")
 
-// Or use hybrid locker (auto-fallback to local lock)
+// 或使用混合锁（自动降级到本地锁）
 hybridLocker := lock.NewHybridLocker(client)
 success, err := hybridLocker.Lock("my-lock-key")
 ```
 
-### Rate Limiting
+### 限流器
 
 ```go
 import (
@@ -86,39 +86,39 @@ import (
     "time"
 )
 
-// Create a rate limiter
+// 创建限流器
 limiter := ratelimit.NewRateLimiter(client)
 
-// Check rate limit
+// 检查限流
 allowed, remaining, resetTime, err := limiter.CheckLimit(
     ctx,
     "user:123",
-    10,                    // limit: 10 requests
-    1 * time.Hour,         // window: 1 hour
+    10,                    // 限制：10 次请求
+    1 * time.Hour,         // 窗口：1 小时
 )
 
-// Check cooldown
+// 检查冷却时间
 allowed, resetTime, err := limiter.CheckCooldown(
     ctx,
     "challenge:abc",
-    60 * time.Second,      // cooldown: 60 seconds
+    60 * time.Second,      // 冷却：60 秒
 )
 
-// Convenience methods
+// 便捷方法
 allowed, remaining, resetTime, err := limiter.CheckUserLimit(ctx, "user123", 10, time.Hour)
 allowed, remaining, resetTime, err := limiter.CheckIPLimit(ctx, "192.168.1.1", 5, time.Minute)
 allowed, remaining, resetTime, err := limiter.CheckDestinationLimit(ctx, "user@example.com", 10, time.Hour)
 ```
 
-### Caching
+### 缓存
 
 ```go
 import "github.com/soulteary/redis-kit/cache"
 
-// Create a cache with key prefix
+// 创建带键前缀的缓存
 c := cache.NewCache(client, "myapp:")
 
-// Set a value
+// 设置值
 type User struct {
     ID   string
     Name string
@@ -126,88 +126,86 @@ type User struct {
 user := User{ID: "123", Name: "Alice"}
 err := c.Set(ctx, "user:123", user, 1*time.Hour)
 
-// Get a value
+// 获取值
 var retrievedUser User
 err := c.Get(ctx, "user:123", &retrievedUser)
 
-// Check existence
+// 检查是否存在
 exists, err := c.Exists(ctx, "user:123")
 
-// Delete
+// 删除
 err := c.Del(ctx, "user:123")
 
-// Get TTL
+// 获取 TTL
 ttl, err := c.TTL(ctx, "user:123")
 
-// Set expiration
+// 设置过期时间
 err := c.Expire(ctx, "user:123", 2*time.Hour)
 ```
 
-### Health Checks
+### 健康检查
 
 ```go
 import "github.com/soulteary/redis-kit/client"
 
-// Simple health check
+// 简单健康检查
 healthy := client.HealthCheck(ctx, client)
 
-// Detailed health status
+// 详细健康状态
 status := client.CheckHealth(ctx, client)
 if !status.Healthy {
-    log.Printf("Redis unhealthy: %v (latency: %v)", status.Error, status.Latency)
+    log.Printf("Redis 不健康: %v (延迟: %v)", status.Error, status.Latency)
 }
 ```
 
-## Project Structure
+## 项目结构
 
 ```
 redis-kit/
-├── client/          # Client initialization and management
-├── lock/            # Distributed locking
-├── ratelimit/       # Rate limiting
-├── cache/           # Generic caching interface
-├── utils/           # Utility functions
-└── testutil/        # Testing utilities (mock Redis)
+├── client/          # 客户端初始化和管理
+├── lock/            # 分布式锁
+├── ratelimit/       # 限流器
+├── cache/           # 通用缓存接口
+├── utils/           # 工具函数
+└── testutil/        # 测试工具（Mock Redis）
 ```
 
-## Requirements
+## 测试覆盖率
 
-- Go 1.25 or later
-- Redis server (optional for testing, mock Redis is provided)
+本项目保持较高的测试覆盖率：
 
-## Test Coverage
-
-This project maintains high test coverage:
-
-| Package | Coverage |
-|---------|----------|
+| 包 | 覆盖率 |
+|------|--------|
 | cache | 100.0% |
 | client | 98.3% |
 | lock | 93.9% |
 | ratelimit | 87.0% |
 | testutil | 90.1% |
 | utils | 100.0% |
-| **Total** | **92.3%** |
+| **总计** | **92.3%** |
 
-The library includes comprehensive tests with mock Redis support, so you can run tests without a real Redis instance:
+运行测试并查看覆盖率：
 
 ```bash
-# Run all tests
+# 运行所有测试
 go test ./... -v
 
-# Run tests with coverage
+# 运行测试并生成覆盖率报告
 go test ./... -coverprofile=coverage.out -covermode=atomic
 
-# Generate HTML coverage report
+# 生成 HTML 覆盖率报告
 go tool cover -html=coverage.out -o coverage.html
 
-# View coverage summary
+# 查看覆盖率摘要
 go tool cover -func=coverage.out
 ```
 
-## Examples
+## 环境要求
 
-### Complete Example: Rate-Limited Cache with Locking
+- Go 1.25 或更高版本
+- Redis 服务器（测试时可选，提供 Mock Redis）
+
+## 完整示例：带限流的缓存与锁
 
 ```go
 package main
@@ -226,54 +224,54 @@ import (
 func main() {
     ctx := context.Background()
     
-    // Initialize Redis client
+    // 初始化 Redis 客户端
     redisClient, err := client.NewClientWithDefaults("localhost:6379")
     if err != nil {
         panic(err)
     }
     defer redisClient.Close()
     
-    // Health check
+    // 健康检查
     if !client.HealthCheck(ctx, redisClient) {
-        panic("Redis is not healthy")
+        panic("Redis 不健康")
     }
     
-    // Create cache
+    // 创建缓存
     userCache := cache.NewCache(redisClient, "user:")
     
-    // Create locker
+    // 创建锁
     locker := lock.NewHybridLocker(redisClient)
     
-    // Create rate limiter
+    // 创建限流器
     limiter := ratelimit.NewRateLimiter(redisClient)
     
-    // Example: Get user with caching and rate limiting
+    // 示例：获取用户（带缓存和限流）
     userID := "user123"
     
-    // Check rate limit
+    // 检查限流
     allowed, remaining, resetTime, err := limiter.CheckUserLimit(ctx, userID, 10, time.Hour)
     if err != nil {
         panic(err)
     }
     if !allowed {
-        fmt.Printf("Rate limit exceeded. Reset at: %v\n", resetTime)
+        fmt.Printf("超出限流。重置时间: %v\n", resetTime)
         return
     }
-    fmt.Printf("Rate limit OK. Remaining: %d\n", remaining)
+    fmt.Printf("限流检查通过。剩余: %d\n", remaining)
     
-    // Try to acquire lock
+    // 尝试获取锁
     lockKey := fmt.Sprintf("user:%s:lock", userID)
     acquired, err := locker.Lock(lockKey)
     if err != nil {
         panic(err)
     }
     if !acquired {
-        fmt.Println("Could not acquire lock")
+        fmt.Println("无法获取锁")
         return
     }
     defer locker.Unlock(lockKey)
     
-    // Check cache first
+    // 先检查缓存
     type User struct {
         ID   string
         Name string
@@ -285,44 +283,44 @@ func main() {
     }
     
     if exists {
-        // Cache hit
+        // 缓存命中
         err = userCache.Get(ctx, userID, &user)
         if err != nil {
             panic(err)
         }
-        fmt.Printf("Cache hit: %+v\n", user)
+        fmt.Printf("缓存命中: %+v\n", user)
     } else {
-        // Cache miss - fetch from database
+        // 缓存未命中 - 从数据库获取
         user = User{ID: userID, Name: "Alice"}
         
-        // Store in cache
+        // 存入缓存
         err = userCache.Set(ctx, userID, user, 1*time.Hour)
         if err != nil {
             panic(err)
         }
-        fmt.Printf("Cached: %+v\n", user)
+        fmt.Printf("已缓存: %+v\n", user)
     }
 }
 ```
 
-## Contributing
+## 贡献
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+欢迎贡献！请随时提交 Pull Request。
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+1. Fork 本仓库
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add some amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建 Pull Request
 
-### Development Guidelines
+### 开发指南
 
-- Follow Go best practices and conventions
-- Add tests for new features
-- Ensure all tests pass (`go test ./...`)
-- Run `go fmt` and `go vet` before committing
-- Update documentation as needed
+- 遵循 Go 最佳实践和规范
+- 为新功能添加测试
+- 确保所有测试通过 (`go test ./...`)
+- 提交前运行 `go fmt` 和 `go vet`
+- 根据需要更新文档
 
-## License
+## 许可证
 
-See LICENSE file for details.
+详见 LICENSE 文件。
