@@ -40,6 +40,28 @@ func TestNewClient(t *testing.T) {
 			t.Error("NewClient() with invalid address should return error")
 		}
 	})
+
+	t.Run("successful creation with mock dialer", func(t *testing.T) {
+		mockClient, mock := testutil.NewMockRedisClient()
+		defer func() { _ = mockClient.Close() }()
+
+		cfg := DefaultConfig().
+			WithAddr("mock").
+			WithDialTimeout(2 * time.Second)
+		cfg.Dialer = mock.Dialer()
+
+		client, err := NewClient(cfg)
+		if err != nil {
+			t.Fatalf("NewClient() with mock dialer error = %v, want nil", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		// Verify connection works
+		ctx := context.Background()
+		if err := client.Ping(ctx).Err(); err != nil {
+			t.Errorf("Ping() after NewClient error = %v, want nil", err)
+		}
+	})
 }
 
 func TestNewClientWithDefaults(t *testing.T) {

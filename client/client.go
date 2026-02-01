@@ -26,6 +26,9 @@ func NewClient(cfg Config) (*redis.Client, error) {
 		MaxRetries:   cfg.MaxRetries,
 		PoolTimeout:  cfg.PoolTimeout,
 	}
+	if cfg.Dialer != nil {
+		opts.Dialer = cfg.Dialer
+	}
 
 	client := redis.NewClient(opts)
 

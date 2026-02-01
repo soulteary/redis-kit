@@ -1,8 +1,13 @@
 package client
 
 import (
+	"context"
+	"net"
 	"time"
 )
+
+// Dialer is the type for custom Redis connection dialer (optional, for testing or custom network).
+type Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // Config represents Redis client configuration
 type Config struct {
@@ -35,6 +40,9 @@ type Config struct {
 
 	// PoolTimeout is the timeout for getting a connection from the pool (default: 4s)
 	PoolTimeout time.Duration
+
+	// Dialer is optional custom dialer (e.g. for mock in tests). When set, Addr can be a placeholder.
+	Dialer Dialer
 }
 
 // DefaultConfig returns a Config with default values

@@ -1,7 +1,10 @@
 package testutil
 
 import (
+	"bufio"
 	"context"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +60,12 @@ func TestNewMockRedisClient(t *testing.T) {
 	}
 	if pong != "PONG" {
 		t.Errorf("Ping() = %q, want %q", pong, "PONG")
+	}
+
+	// Cover Dialer() - used by client package for NewClient with mock
+	dialer := mock.Dialer()
+	if dialer == nil {
+		t.Error("Dialer() returned nil")
 	}
 }
 
@@ -740,5 +749,95 @@ func TestMockRedis_Incr_Preserves_TTL(t *testing.T) {
 	}
 	if ttl <= 0 {
 		t.Errorf("TTL after Incr = %v, should be positive", ttl)
+	}
+}
+
+// TestMockRedis_EmptyCommand sends raw RESP to trigger handleCommand with empty args
+func TestMockRedis_EmptyCommand(t *testing.T) {
+	mock := NewMockRedis()
+	clientConn, serverConn := net.Pipe()
+	go mock.serveConn(serverConn)
+	defer func() { _ = clientConn.Close() }()
+
+	// Send empty array (*0\r\n) so handleCommand gets empty args
+	_, _ = clientConn.Write([]byte("*0\r\n"))
+	buf := make([]byte, 128)
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	resp := string(buf[:n])
+	if resp != "-ERR empty command\r\n" {
+		t.Errorf("empty command response = %q, want %q", resp, "-ERR empty command\r\n")
+	}
+}
+
+// TestMockRedis_HandleExpireInvalidArgs sends EXPIRE with too few args via raw RESP
+func TestMockRedis_HandleExpireInvalidArgs(t *testing.T) {
+	mock := NewMockRedis()
+	clientConn, serverConn := net.Pipe()
+	go mock.serveConn(serverConn)
+	defer func() { _ = clientConn.Close() }()
+
+	// EXPIRE with only 1 arg: *2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n (missing seconds)
+	_, _ = clientConn.Write([]byte("*2\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n"))
+	buf := make([]byte, 128)
+	n, _ := clientConn.Read(buf)
+	resp := string(buf[:n])
+	if resp != "-ERR invalid args\r\n" {
+		t.Errorf("EXPIRE invalid args response = %q, want %q", resp, "-ERR invalid args\r\n")
+	}
+}
+
+// TestMockRedis_HandleExpireInvalidSeconds sends EXPIRE with non-numeric seconds
+func TestMockRedis_HandleExpireInvalidSeconds(t *testing.T) {
+	mock := NewMockRedis()
+	clientConn, serverConn := net.Pipe()
+	go mock.serveConn(serverConn)
+	defer func() { _ = clientConn.Close() }()
+
+	// EXPIRE key notnumber
+	_, _ = clientConn.Write([]byte("*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$9\r\nnotnumber\r\n"))
+	buf := make([]byte, 128)
+	n, _ := clientConn.Read(buf)
+	resp := string(buf[:n])
+	if resp != "-ERR invalid seconds\r\n" {
+		t.Errorf("EXPIRE invalid seconds response = %q, want %q", resp, "-ERR invalid seconds\r\n")
+	}
+}
+
+// TestMockRedis_ReadCommandUnexpectedPrefix sends invalid RESP prefix to trigger readCommand error path
+func TestMockRedis_ReadCommandUnexpectedPrefix(t *testing.T) {
+	mock := NewMockRedis()
+	clientConn, serverConn := net.Pipe()
+	go mock.serveConn(serverConn)
+	defer func() { _ = clientConn.Close() }()
+
+	// Send $ instead of * (unexpected prefix) - readCommand returns error, serveConn exits
+	_, _ = clientConn.Write([]byte("$1\r\nx\r\n"))
+	buf := make([]byte, 128)
+	_, err := clientConn.Read(buf)
+	// serveConn returns on readCommand error without writing; connection may close
+	_ = err
+}
+
+// TestReadLineError covers readLine error path (e.g. EOF before newline)
+func TestReadLineError(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("incomplete"))
+	_, err := readLine(r)
+	if err == nil {
+		t.Error("readLine with incomplete input should return error")
+	}
+}
+
+// TestReadLineTrimsCRLF covers readLine trim behavior
+func TestReadLineTrimsCRLF(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("hello\r\n"))
+	line, err := readLine(r)
+	if err != nil {
+		t.Fatalf("readLine() error = %v", err)
+	}
+	if line != "hello" {
+		t.Errorf("readLine() = %q, want %q", line, "hello")
 	}
 }

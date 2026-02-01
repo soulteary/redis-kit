@@ -48,6 +48,11 @@ func (m *MockRedis) dialer(_ context.Context, _, _ string) (net.Conn, error) {
 	return clientConn, nil
 }
 
+// Dialer returns a function that can be used as client.Config.Dialer for testing.
+func (m *MockRedis) Dialer() func(context.Context, string, string) (net.Conn, error) {
+	return m.dialer
+}
+
 // serveConn handles connections to the mock Redis
 func (m *MockRedis) serveConn(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
@@ -60,6 +65,7 @@ func (m *MockRedis) serveConn(conn net.Conn) {
 			return
 		}
 		if err := m.handleCommand(args, writer); err != nil {
+			_ = writer.Flush() // flush error response before closing
 			return
 		}
 		if err := writer.Flush(); err != nil {

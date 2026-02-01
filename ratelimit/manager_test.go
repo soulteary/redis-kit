@@ -667,6 +667,52 @@ func TestRateLimiter_CheckLimit_RedisFailures(t *testing.T) {
 
 		mock.SetShouldFail(false)
 	})
+
+	t.Run("first increment sets expiration (newCount == 1)", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Set key to "0" so that Get returns 0, then Incr gives newCount=1 (triggers Expire branch)
+		redisKey := limiter.keyPrefix + "zerocount"
+		_ = client.Set(ctx, redisKey, "0", time.Hour).Err()
+
+		allowed, remaining, _, err := limiter.CheckLimit(ctx, "zerocount", 10, time.Hour)
+		if err != nil {
+			t.Fatalf("CheckLimit() error = %v", err)
+		}
+		if !allowed {
+			t.Error("CheckLimit() allowed = false, want true")
+		}
+		if remaining != 9 {
+			t.Errorf("CheckLimit() remaining = %d, want 9", remaining)
+		}
+	})
+
+	t.Run("existing key with no TTL gets expiration (ttl <= 0 branch)", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		// Set key with no expiration (TTL 0)
+		redisKey := limiter.keyPrefix + "noexpkey"
+		_ = client.Set(ctx, redisKey, "1", 0).Err()
+
+		allowed, remaining, _, err := limiter.CheckLimit(ctx, "noexpkey", 10, time.Hour)
+		if err != nil {
+			t.Fatalf("CheckLimit() error = %v", err)
+		}
+		if !allowed {
+			t.Error("CheckLimit() allowed = false, want true")
+		}
+		if remaining != 8 {
+			t.Errorf("CheckLimit() remaining = %d, want 8", remaining)
+		}
+	})
 }
 
 func TestRateLimiter_CheckCooldown_RedisFailures(t *testing.T) {

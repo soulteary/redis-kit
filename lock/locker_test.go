@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -276,6 +277,28 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		// Reset
 		mock.SetShouldFail(false)
 	})
+
+	t.Run("unlock with lock value type error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		locker := NewRedisLocker(client)
+		key := "test-lock"
+
+		// Lock first to have key in Redis
+		_, _ = locker.Lock(key)
+
+		// Corrupt lockStore: store non-string value (simulate type assertion failure)
+		locker.lockStore.Store(key, 123)
+
+		err := locker.Unlock(key)
+		if err == nil {
+			t.Error("Unlock() with non-string lock value should return error")
+		}
+		if err != nil && err.Error() != "lock value type error" {
+			t.Errorf("Unlock() error = %q, want %q", err.Error(), "lock value type error")
+		}
+	})
 }
 
 func TestHybridLocker(t *testing.T) {
@@ -422,6 +445,42 @@ func TestHybridLocker(t *testing.T) {
 		err := locker.Unlock(key)
 		if err != nil {
 			t.Errorf("HybridLocker.Unlock() with local lock error = %v, want nil", err)
+		}
+	})
+
+	t.Run("hybrid unlock returns error on lock value mismatch without fallback", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		locker := NewHybridLocker(client)
+		key := "mismatch-lock"
+
+		// Lock with Redis
+		_, _ = locker.Lock(key)
+
+		// Simulate another locker instance trying to unlock (wrong value in store)
+		locker2 := NewRedisLocker(client)
+		locker2.lockStore.Store(key, "wrong-value")
+		// Unlock with locker2 fails with "lock value mismatch or lock has expired"
+		err2 := locker2.Unlock(key)
+		if err2 == nil {
+			t.Fatal("locker2.Unlock() should fail with mismatch")
+		}
+
+		// Hybrid: unlock with a hybrid that has Redis locker but "our" unlock would get mismatch
+		// We need Hybrid to get the mismatch path: Redis unlock returns error containing "lock value mismatch"
+		// So use the same hybrid locker but corrupt its redis lockStore for this key so Redis Unlock returns mismatch
+		hl := NewHybridLocker(client)
+		_, _ = hl.Lock(key) // now hl holds the lock
+		// Corrupt: make Redis think we have different value so Eval returns 0
+		hl.redisLocker.lockStore.Store(key, "wrong-value")
+		err := hl.Unlock(key)
+		// Should return the mismatch error, not fall back to local
+		if err == nil {
+			t.Error("HybridLocker.Unlock() with lock value mismatch should return error")
+		}
+		if err != nil && !strings.Contains(err.Error(), "lock value mismatch") && !strings.Contains(err.Error(), "lock has expired") {
+			t.Errorf("HybridLocker.Unlock() error = %v, want mismatch or expired", err)
 		}
 	})
 }
