@@ -485,6 +485,32 @@ func TestHybridLocker(t *testing.T) {
 			t.Errorf("HybridLocker.Unlock() error = %v, want %v", err, ErrLockValueMismatch)
 		}
 	})
+
+	// Redis Unlock 失败（如网络错误）且本地未持有该 key 时，应返回 Redis 错误而非 fallback 成功
+	t.Run("hybrid unlock returns Redis error when Redis fails and local lock not held", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		locker := NewHybridLocker(client)
+		key := "redis-fail-key"
+
+		// 先通过 Redis 加锁成功
+		success, err := locker.Lock(key)
+		if err != nil || !success {
+			t.Fatalf("Lock() = %v, %v, want true, nil", success, err)
+		}
+
+		// 模拟 Unlock 时 Redis 报错（如连接失败）
+		mock.SetShouldFail(true)
+		defer mock.SetShouldFail(false)
+
+		// Unlock：Redis 会失败，且该 key 是 Redis 锁持有的，本地 locker 没有此 key，fallback 到 local unlock 会返回 ErrLockNotHeld
+		// 因此应返回 Redis 的错误，而不是 nil
+		err = locker.Unlock(key)
+		if err == nil {
+			t.Error("HybridLocker.Unlock() when Redis fails and local not held should return error")
+		}
+	})
 }
 
 func TestRedisLocker_Concurrent(t *testing.T) {

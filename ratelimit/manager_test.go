@@ -186,6 +186,70 @@ func TestRateLimiter_CheckLimit(t *testing.T) {
 		}
 	})
 
+	t.Run("zero window error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, _, err := limiter.CheckLimit(ctx, "key1", 10, 0)
+		if err == nil {
+			t.Error("CheckLimit() with zero window should return error")
+		}
+		if err.Error() != "window must be positive" {
+			t.Errorf("CheckLimit() error = %q, want %q", err.Error(), "window must be positive")
+		}
+	})
+
+	t.Run("negative window error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, _, err := limiter.CheckLimit(ctx, "key1", 10, -time.Second)
+		if err == nil {
+			t.Error("CheckLimit() with negative window should return error")
+		}
+		if err.Error() != "window must be positive" {
+			t.Errorf("CheckLimit() error = %q, want %q", err.Error(), "window must be positive")
+		}
+	})
+
+	t.Run("zero window error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, _, err := limiter.CheckLimit(ctx, "key1", 10, 0)
+		if err == nil {
+			t.Error("CheckLimit() with zero window should return error")
+		}
+		if err.Error() != "window must be positive" {
+			t.Errorf("CheckLimit() error = %q, want %q", err.Error(), "window must be positive")
+		}
+	})
+
+	t.Run("negative window error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, _, err := limiter.CheckLimit(ctx, "key1", 10, -time.Second)
+		if err == nil {
+			t.Error("CheckLimit() with negative window should return error")
+		}
+		if err.Error() != "window must be positive" {
+			t.Errorf("CheckLimit() error = %q, want %q", err.Error(), "window must be positive")
+		}
+	})
+
 	t.Run("reset time calculation", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
@@ -331,6 +395,38 @@ func TestRateLimiter_CheckCooldown(t *testing.T) {
 		}
 		if err.Error() != "redis client is nil" {
 			t.Errorf("CheckCooldown() error = %q, want %q", err.Error(), "redis client is nil")
+		}
+	})
+
+	t.Run("zero cooldown error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, err := limiter.CheckCooldown(ctx, "key1", 0)
+		if err == nil {
+			t.Error("CheckCooldown() with zero cooldown should return error")
+		}
+		if err.Error() != "cooldown must be positive" {
+			t.Errorf("CheckCooldown() error = %q, want %q", err.Error(), "cooldown must be positive")
+		}
+	})
+
+	t.Run("negative cooldown error", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		limiter := NewRateLimiter(client)
+		ctx := context.Background()
+
+		_, _, err := limiter.CheckCooldown(ctx, "key1", -time.Minute)
+		if err == nil {
+			t.Error("CheckCooldown() with negative cooldown should return error")
+		}
+		if err.Error() != "cooldown must be positive" {
+			t.Errorf("CheckCooldown() error = %q, want %q", err.Error(), "cooldown must be positive")
 		}
 	})
 

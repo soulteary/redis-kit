@@ -184,18 +184,6 @@ redis-kit/
 
 ## Test Coverage
 
-This project maintains high test coverage:
-
-| Package | Coverage |
-|---------|----------|
-| cache | 100.0% |
-| client | 98.3% |
-| lock | 93.9% |
-| ratelimit | 87.0% |
-| testutil | 90.1% |
-| utils | 100.0% |
-| **Total** | **92.3%** |
-
 The library includes comprehensive tests with mock Redis support, so you can run tests without a real Redis instance:
 
 ```bash
