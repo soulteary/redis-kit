@@ -78,6 +78,10 @@ hybridLocker := lock.NewHybridLocker(client)
 success, err := hybridLocker.Lock("my-lock-key")
 ```
 
+**Notes**
+- `Unlock` requires the same process to hold the lock value; unlocking a key without a local lock value returns an error to avoid deleting someone else's lock.
+- `HybridLocker` falls back to a local lock only when Redis operations fail. In multi-instance deployments, avoid relying on local fallback unless you accept split-brain behavior.
+
 ### Rate Limiting
 
 ```go
@@ -109,6 +113,9 @@ allowed, remaining, resetTime, err := limiter.CheckUserLimit(ctx, "user123", 10,
 allowed, remaining, resetTime, err := limiter.CheckIPLimit(ctx, "192.168.1.1", 5, time.Minute)
 allowed, remaining, resetTime, err := limiter.CheckDestinationLimit(ctx, "user@example.com", 10, time.Hour)
 ```
+
+**Notes**
+- Rate limiting and cooldown checks use Redis Lua scripts (`EVAL`) to ensure atomicity; make sure scripts are allowed in your Redis deployment.
 
 ### Caching
 

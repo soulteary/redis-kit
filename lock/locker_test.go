@@ -1,7 +1,7 @@
 package lock
 
 import (
-	"strings"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -200,8 +200,8 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		if err == nil {
 			t.Error("Unlock() with mismatched lock value should return error")
 		}
-		if err != nil && err.Error() != "lock value mismatch or lock has expired" {
-			t.Logf("Unlock() error = %v (acceptable)", err)
+		if !errors.Is(err, ErrLockValueMismatch) {
+			t.Errorf("Unlock() error = %v, want %v", err, ErrLockValueMismatch)
 		}
 	})
 
@@ -227,11 +227,10 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		locker := NewRedisLocker(client)
 		key := "non-existent-lock"
 
-		// Unlocking a non-existent lock should not error (backward compatibility)
+		// Unlocking a non-existent lock should error
 		err := locker.Unlock(key)
-		if err != nil {
-			// It's okay if it errors, but it should handle gracefully
-			t.Logf("Unlock() on non-existent lock returned error (acceptable): %v", err)
+		if !errors.Is(err, ErrLockNotHeld) {
+			t.Errorf("Unlock() on non-existent lock error = %v, want %v", err, ErrLockNotHeld)
 		}
 	})
 
@@ -252,6 +251,9 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		err := locker.Unlock(key)
 		if err == nil {
 			t.Log("Unlock() on expired lock succeeded (lock may have been auto-expired)")
+		}
+		if err != nil && !errors.Is(err, ErrLockValueMismatch) && !errors.Is(err, ErrLockNotHeld) {
+			t.Errorf("Unlock() on expired lock error = %v, want mismatch or not held", err)
 		}
 	})
 
@@ -295,8 +297,8 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		if err == nil {
 			t.Error("Unlock() with non-string lock value should return error")
 		}
-		if err != nil && err.Error() != "lock value type error" {
-			t.Errorf("Unlock() error = %q, want %q", err.Error(), "lock value type error")
+		if !errors.Is(err, ErrLockValueType) {
+			t.Errorf("Unlock() error = %v, want %v", err, ErrLockValueType)
 		}
 	})
 }
@@ -479,8 +481,8 @@ func TestHybridLocker(t *testing.T) {
 		if err == nil {
 			t.Error("HybridLocker.Unlock() with lock value mismatch should return error")
 		}
-		if err != nil && !strings.Contains(err.Error(), "lock value mismatch") && !strings.Contains(err.Error(), "lock has expired") {
-			t.Errorf("HybridLocker.Unlock() error = %v, want mismatch or expired", err)
+		if !errors.Is(err, ErrLockValueMismatch) {
+			t.Errorf("HybridLocker.Unlock() error = %v, want %v", err, ErrLockValueMismatch)
 		}
 	})
 }

@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -14,6 +15,46 @@ const (
 	// DefaultCooldownPrefix is the default prefix for cooldown keys
 	DefaultCooldownPrefix = "ratelimit:cooldown:"
 )
+
+const rateLimitScript = `
+-- redis-kit:ratelimit
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local current = redis.call("get", key)
+if not current then
+	redis.call("set", key, 1, "px", window)
+	return {1, limit - 1, window}
+end
+current = tonumber(current)
+if current >= limit then
+	local ttl = redis.call("pttl", key)
+	return {0, 0, ttl}
+end
+current = redis.call("incr", key)
+local ttl = redis.call("pttl", key)
+if ttl < 0 then
+	redis.call("pexpire", key, window)
+	ttl = window
+end
+local remaining = limit - current
+if remaining < 0 then
+	remaining = 0
+end
+return {1, remaining, ttl}
+`
+
+const cooldownScript = `
+-- redis-kit:cooldown
+local key = KEYS[1]
+local cooldown = tonumber(ARGV[1])
+local res = redis.call("set", key, "1", "px", cooldown, "nx")
+if res then
+	return {1, cooldown}
+end
+local ttl = redis.call("pttl", key)
+return {0, ttl}
+`
 
 // RateLimiter provides rate limiting functionality using Redis
 type RateLimiter struct {
@@ -43,64 +84,42 @@ func (r *RateLimiter) CheckLimit(ctx context.Context, key string, limit int, win
 		return false, 0, time.Time{}, fmt.Errorf("redis client is nil")
 	}
 
+	windowMs := window.Milliseconds()
+	if windowMs <= 0 {
+		return false, 0, time.Time{}, fmt.Errorf("window must be positive")
+	}
+
 	redisKey := r.keyPrefix + key
 
-	// Get current count
-	count, err := r.client.Get(ctx, redisKey).Int()
-	if err == redis.Nil {
-		// First request, set count to 1
-		if err := r.client.Set(ctx, redisKey, 1, window).Err(); err != nil {
-			return false, 0, time.Time{}, fmt.Errorf("failed to set rate limit: %w", err)
-		}
-		remaining := limit - 1
-		resetTime := time.Now().Add(window)
-		return true, remaining, resetTime, nil
-	}
+	result, err := r.client.Eval(ctx, rateLimitScript, []string{redisKey}, limit, windowMs).Result()
 	if err != nil {
-		return false, 0, time.Time{}, fmt.Errorf("failed to get rate limit: %w", err)
+		return false, 0, time.Time{}, fmt.Errorf("failed to apply rate limit: %w", err)
 	}
 
-	// Check if limit exceeded
-	if count >= limit {
-		ttl := r.client.TTL(ctx, redisKey).Val()
-		resetTime := time.Now().Add(ttl)
-		return false, 0, resetTime, nil
+	values, ok := result.([]interface{})
+	if !ok || len(values) != 3 {
+		return false, 0, time.Time{}, fmt.Errorf("unexpected rate limit response")
 	}
 
-	// Increment count
-	newCount, err := r.client.Incr(ctx, redisKey).Result()
-	if err != nil {
-		return false, 0, time.Time{}, fmt.Errorf("failed to increment rate limit: %w", err)
+	allowedInt, ok := toInt64(values[0])
+	if !ok {
+		return false, 0, time.Time{}, fmt.Errorf("invalid rate limit allowed value")
+	}
+	remainingInt, ok := toInt64(values[1])
+	if !ok {
+		return false, 0, time.Time{}, fmt.Errorf("invalid rate limit remaining value")
+	}
+	ttlMs, ok := toInt64(values[2])
+	if !ok {
+		return false, 0, time.Time{}, fmt.Errorf("invalid rate limit ttl value")
 	}
 
-	// Set expiration if this is the first increment (key was just created)
-	// When key already exists, expiration is already set, so we only need to set it for new keys
-	if newCount == 1 {
-		if err := r.client.Expire(ctx, redisKey, window).Err(); err != nil {
-			// Log warning but don't fail - expiration might already be set
-			_ = err
-		}
-	} else {
-		// Ensure expiration is set even if key existed (defensive programming)
-		ttl := r.client.TTL(ctx, redisKey).Val()
-		if ttl <= 0 {
-			// Key exists but has no expiration, set it
-			if err := r.client.Expire(ctx, redisKey, window).Err(); err != nil {
-				// Log warning but don't fail
-				_ = err
-			}
-		}
+	if ttlMs < 0 {
+		ttlMs = 0
 	}
+	resetTime := time.Now().Add(time.Duration(ttlMs) * time.Millisecond)
 
-	remaining := limit - int(newCount)
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	ttl := r.client.TTL(ctx, redisKey).Val()
-	resetTime := time.Now().Add(ttl)
-
-	return true, remaining, resetTime, nil
+	return allowedInt == 1, int(remainingInt), resetTime, nil
 }
 
 // CheckCooldown checks if resend is allowed (cooldown period)
@@ -110,26 +129,37 @@ func (r *RateLimiter) CheckCooldown(ctx context.Context, key string, cooldown ti
 		return false, time.Time{}, fmt.Errorf("redis client is nil")
 	}
 
+	cooldownMs := cooldown.Milliseconds()
+	if cooldownMs <= 0 {
+		return false, time.Time{}, fmt.Errorf("cooldown must be positive")
+	}
+
 	redisKey := r.cooldownPrefix + key
 
-	exists, err := r.client.Exists(ctx, redisKey).Result()
+	result, err := r.client.Eval(ctx, cooldownScript, []string{redisKey}, cooldownMs).Result()
 	if err != nil {
-		return false, time.Time{}, fmt.Errorf("failed to check cooldown: %w", err)
+		return false, time.Time{}, fmt.Errorf("failed to apply cooldown: %w", err)
 	}
 
-	if exists > 0 {
-		ttl := r.client.TTL(ctx, redisKey).Val()
-		resetTime := time.Now().Add(ttl)
-		return false, resetTime, nil
+	values, ok := result.([]interface{})
+	if !ok || len(values) != 2 {
+		return false, time.Time{}, fmt.Errorf("unexpected cooldown response")
 	}
 
-	// Set cooldown
-	if err := r.client.Set(ctx, redisKey, "1", cooldown).Err(); err != nil {
-		return false, time.Time{}, fmt.Errorf("failed to set cooldown: %w", err)
+	allowedInt, ok := toInt64(values[0])
+	if !ok {
+		return false, time.Time{}, fmt.Errorf("invalid cooldown allowed value")
 	}
+	ttlMs, ok := toInt64(values[1])
+	if !ok {
+		return false, time.Time{}, fmt.Errorf("invalid cooldown ttl value")
+	}
+	if ttlMs < 0 {
+		ttlMs = 0
+	}
+	resetTime := time.Now().Add(time.Duration(ttlMs) * time.Millisecond)
 
-	resetTime := time.Now().Add(cooldown)
-	return true, resetTime, nil
+	return allowedInt == 1, resetTime, nil
 }
 
 // CheckUserLimit checks rate limit for a user
@@ -148,4 +178,21 @@ func (r *RateLimiter) CheckIPLimit(ctx context.Context, ip string, limit int, wi
 func (r *RateLimiter) CheckDestinationLimit(ctx context.Context, destination string, limit int, window time.Duration) (bool, int, time.Time, error) {
 	key := fmt.Sprintf("dest:%s", destination)
 	return r.CheckLimit(ctx, key, limit, window)
+}
+
+func toInt64(value interface{}) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case string:
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }

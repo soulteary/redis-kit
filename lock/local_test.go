@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -96,10 +97,10 @@ func TestLocalLocker_Unlock(t *testing.T) {
 		locker := NewLocalLocker()
 		key := "non-existent-key"
 
-		// Unlocking a non-existent lock should succeed (no error)
+		// Unlocking a non-existent lock should return an error
 		err := locker.Unlock(key)
-		if err != nil {
-			t.Errorf("Unlock() on non-existent lock error = %v, want nil", err)
+		if !errors.Is(err, ErrLockNotHeld) {
+			t.Errorf("Unlock() on non-existent lock error = %v, want %v", err, ErrLockNotHeld)
 		}
 	})
 

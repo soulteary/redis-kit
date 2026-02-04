@@ -40,6 +40,9 @@ func (l *LocalLocker) Unlock(key string) error {
 	defer l.mu.Unlock()
 
 	// Release lock
+	if !l.locks[key] {
+		return ErrLockNotHeld
+	}
 	delete(l.locks, key)
 	return nil
 }
