@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -87,15 +87,12 @@ func (r *RedisLocker) Unlock(key string) error {
 	// Get stored lockValue
 	value, ok := r.lockStore.LoadAndDelete(key)
 	if !ok {
-		// If no stored lockValue, directly delete (backward compatibility, but not secure)
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
-		defer cancel()
-		return r.client.Del(ctx, key).Err()
+		return ErrLockNotHeld
 	}
 
 	lockValue, ok := value.(string)
 	if !ok {
-		return fmt.Errorf("lock value type error")
+		return ErrLockValueType
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
@@ -116,7 +113,7 @@ func (r *RedisLocker) Unlock(key string) error {
 
 	// Check if lock was actually released
 	if val, ok := result.(int64); !ok || val == 0 {
-		return fmt.Errorf("lock value mismatch or lock has expired")
+		return ErrLockValueMismatch
 	}
 
 	return nil
@@ -171,11 +168,14 @@ func (h *HybridLocker) Unlock(key string) error {
 		// If Redis unlock fails due to lock value mismatch or lock expired,
 		// we should return the error instead of falling back to local lock
 		// Only fall back to local lock for connection/network errors
-		errStr := err.Error()
-		if strings.Contains(errStr, "lock value mismatch") || strings.Contains(errStr, "lock has expired") {
+		if errors.Is(err, ErrLockValueMismatch) || errors.Is(err, ErrLockValueType) {
 			return err
 		}
 		// For other errors (e.g., connection failures), try local unlock
+		if localErr := h.localLocker.Unlock(key); localErr == nil {
+			return nil
+		}
+		return err
 	}
 
 	// Fall back to local lock

@@ -523,19 +523,11 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 
 		wg.Wait()
 
-		// In concurrent environment, mock Redis Get/Set/Incr are not atomic, so race conditions
-		// can allow more than `limit` successes (or occasionally fewer). We only assert:
-		// 1. At least one request succeeded (no deadlock/crash)
-		// 2. At most numGoroutines succeeded (sanity)
 		if successCount <= 0 {
 			t.Errorf("concurrent CheckLimit() successCount = %d, want > 0", successCount)
 		}
-		if successCount > numGoroutines {
-			t.Errorf("concurrent CheckLimit() successCount = %d, want <= %d", successCount, numGoroutines)
-		}
-		// Log when result is outside ideal range (mock non-atomicity can allow all through)
-		if successCount < limit-2 || successCount > limit+2 {
-			t.Logf("concurrent CheckLimit() successCount = %d, ideal around %d (mock may allow more due to race)", successCount, limit)
+		if successCount > limit {
+			t.Errorf("concurrent CheckLimit() successCount = %d, want <= %d", successCount, limit)
 		}
 	})
 
@@ -569,20 +561,8 @@ func TestRateLimiter_Concurrent(t *testing.T) {
 
 		wg.Wait()
 
-		// In concurrent environment, due to race conditions between Exists and Set,
-		// multiple goroutines might succeed. The important thing is:
-		// 1. At least one should succeed (successCount >= 1)
-		// 2. Not all should succeed (successCount < numGoroutines)
-		// 3. Ideally, only 1 should succeed, but we allow a small tolerance
-		if successCount < 1 {
-			t.Errorf("concurrent CheckCooldown() successCount = %d, want >= 1", successCount)
-		}
-		if successCount >= numGoroutines {
-			t.Errorf("concurrent CheckCooldown() successCount = %d, want < %d (cooldown should prevent most)", successCount, numGoroutines)
-		}
-		// Allow tolerance for race conditions (typically 1-2 should succeed)
-		if successCount > 3 {
-			t.Logf("concurrent CheckCooldown() successCount = %d, expected 1-2 (race condition tolerance)", successCount)
+		if successCount != 1 {
+			t.Errorf("concurrent CheckCooldown() successCount = %d, want 1", successCount)
 		}
 	})
 }
@@ -607,115 +587,26 @@ func TestRateLimiter_KeyPrefixes(t *testing.T) {
 }
 
 func TestRateLimiter_CheckLimit_RedisFailures(t *testing.T) {
-	t.Run("redis get failure", func(t *testing.T) {
+	t.Run("redis eval failure", func(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
 		limiter := NewRateLimiter(client)
 		ctx := context.Background()
 
-		// First request to set up the key
-		_, _, _, _ = limiter.CheckLimit(ctx, "failkey1", 10, time.Hour)
-
-		// Make Redis fail for subsequent operations
 		mock.SetShouldFail(true)
 
-		_, _, _, err := limiter.CheckLimit(ctx, "failkey1", 10, time.Hour)
+		_, _, _, err := limiter.CheckLimit(ctx, "failkey3", 10, time.Hour)
 		if err == nil {
 			t.Error("CheckLimit() with Redis failure should return error")
 		}
 
 		mock.SetShouldFail(false)
 	})
-
-	t.Run("redis incr failure", func(t *testing.T) {
-		client, mock := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		limiter := NewRateLimiter(client)
-		ctx := context.Background()
-
-		// First request to set up the key
-		_, _, _, _ = limiter.CheckLimit(ctx, "failkey2", 10, time.Hour)
-
-		// Make Redis fail for subsequent operations
-		mock.SetShouldFail(true)
-
-		_, _, _, err := limiter.CheckLimit(ctx, "failkey2", 10, time.Hour)
-		if err == nil {
-			t.Error("CheckLimit() with Redis Incr failure should return error")
-		}
-
-		mock.SetShouldFail(false)
-	})
-
-	t.Run("redis set failure on first request", func(t *testing.T) {
-		client, mock := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		limiter := NewRateLimiter(client)
-		ctx := context.Background()
-
-		// Make Redis fail immediately
-		mock.SetShouldFail(true)
-
-		_, _, _, err := limiter.CheckLimit(ctx, "failkey3", 10, time.Hour)
-		if err == nil {
-			t.Error("CheckLimit() with Redis Set failure should return error")
-		}
-
-		mock.SetShouldFail(false)
-	})
-
-	t.Run("first increment sets expiration (newCount == 1)", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		limiter := NewRateLimiter(client)
-		ctx := context.Background()
-
-		// Set key to "0" so that Get returns 0, then Incr gives newCount=1 (triggers Expire branch)
-		redisKey := limiter.keyPrefix + "zerocount"
-		_ = client.Set(ctx, redisKey, "0", time.Hour).Err()
-
-		allowed, remaining, _, err := limiter.CheckLimit(ctx, "zerocount", 10, time.Hour)
-		if err != nil {
-			t.Fatalf("CheckLimit() error = %v", err)
-		}
-		if !allowed {
-			t.Error("CheckLimit() allowed = false, want true")
-		}
-		if remaining != 9 {
-			t.Errorf("CheckLimit() remaining = %d, want 9", remaining)
-		}
-	})
-
-	t.Run("existing key with no TTL gets expiration (ttl <= 0 branch)", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		limiter := NewRateLimiter(client)
-		ctx := context.Background()
-
-		// Set key with no expiration (TTL 0)
-		redisKey := limiter.keyPrefix + "noexpkey"
-		_ = client.Set(ctx, redisKey, "1", 0).Err()
-
-		allowed, remaining, _, err := limiter.CheckLimit(ctx, "noexpkey", 10, time.Hour)
-		if err != nil {
-			t.Fatalf("CheckLimit() error = %v", err)
-		}
-		if !allowed {
-			t.Error("CheckLimit() allowed = false, want true")
-		}
-		if remaining != 8 {
-			t.Errorf("CheckLimit() remaining = %d, want 8", remaining)
-		}
-	})
 }
 
 func TestRateLimiter_CheckCooldown_RedisFailures(t *testing.T) {
-	t.Run("redis exists failure", func(t *testing.T) {
+	t.Run("redis eval failure", func(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
@@ -726,36 +617,10 @@ func TestRateLimiter_CheckCooldown_RedisFailures(t *testing.T) {
 
 		_, _, err := limiter.CheckCooldown(ctx, "coolfailkey1", 60*time.Second)
 		if err == nil {
-			t.Error("CheckCooldown() with Redis Exists failure should return error")
+			t.Error("CheckCooldown() with Redis failure should return error")
 		}
 
 		mock.SetShouldFail(false)
-	})
-
-	t.Run("redis set failure after exists check", func(t *testing.T) {
-		client, mock := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		limiter := NewRateLimiter(client)
-		ctx := context.Background()
-
-		// We can't easily test the set failure after exists succeeds with the current mock
-		// But we can test that the basic flow works
-		allowed1, _, err1 := limiter.CheckCooldown(ctx, "coolfailkey2", 60*time.Second)
-		if err1 != nil || !allowed1 {
-			t.Error("First CheckCooldown() should succeed")
-		}
-
-		// Second call should be denied (cooldown active)
-		allowed2, _, err2 := limiter.CheckCooldown(ctx, "coolfailkey2", 60*time.Second)
-		if err2 != nil {
-			t.Errorf("CheckCooldown() error = %v", err2)
-		}
-		if allowed2 {
-			t.Error("Second CheckCooldown() should be denied (cooldown active)")
-		}
-
-		_ = mock // Silence unused variable warning
 	})
 }
 

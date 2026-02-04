@@ -78,6 +78,10 @@ hybridLocker := lock.NewHybridLocker(client)
 success, err := hybridLocker.Lock("my-lock-key")
 ```
 
+**注意事项**
+- `Unlock` 需要同一进程持有锁值；当本地没有锁值时会返回错误，以避免误删他人持有的锁。
+- `HybridLocker` 仅在 Redis 操作失败时才回退到本地锁，多实例部署请谨慎使用本地回退以避免“脑裂”。
+
 ### 限流器
 
 ```go
@@ -109,6 +113,9 @@ allowed, remaining, resetTime, err := limiter.CheckUserLimit(ctx, "user123", 10,
 allowed, remaining, resetTime, err := limiter.CheckIPLimit(ctx, "192.168.1.1", 5, time.Minute)
 allowed, remaining, resetTime, err := limiter.CheckDestinationLimit(ctx, "user@example.com", 10, time.Hour)
 ```
+
+**注意事项**
+- 限流与冷却检查使用 Redis Lua 脚本（`EVAL`）保证原子性，请确保 Redis 环境允许执行脚本。
 
 ### 缓存
 
