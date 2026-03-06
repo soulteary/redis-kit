@@ -49,7 +49,7 @@ func generateLockValue() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-// Lock acquires a distributed lock using Redis SETNX
+// Lock acquires a distributed lock using Redis SET key value NX
 // Returns true if the lock was successfully acquired, false if the lock is already held
 func (r *RedisLocker) Lock(key string) (bool, error) {
 	if r.client == nil {
@@ -64,11 +64,11 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
 	defer cancel()
 
-	res, err := r.client.SetNX(ctx, key, lockValue, r.lockTime).Result()
-	if err != nil {
+	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
+	if err != nil && err != redis.Nil {
 		return false, fmt.Errorf("failed to acquire lock: %w", err)
 	}
-
+	res := (err == nil)
 	if res {
 		// Store lockValue for subsequent unlock verification
 		r.lockStore.Store(key, lockValue)

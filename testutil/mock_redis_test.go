@@ -135,12 +135,13 @@ func TestMockRedis_SetNX(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("setnx on new key", func(t *testing.T) {
-		success, err := client.SetNX(ctx, "nxkey1", "value1", 1*time.Hour).Result()
+		_, err := client.SetArgs(ctx, "nxkey1", "value1", redis.SetArgs{Mode: "NX", TTL: 1 * time.Hour}).Result()
 		if err != nil {
-			t.Errorf("SetNX() error = %v", err)
+			t.Errorf("SetArgs() with NX error = %v", err)
 		}
+		success := (err == nil)
 		if !success {
-			t.Error("SetNX() on new key = false, want true")
+			t.Error("SetArgs() with NX on new key = false, want true")
 		}
 
 		val, _ := client.Get(ctx, "nxkey1").Result()
@@ -151,15 +152,16 @@ func TestMockRedis_SetNX(t *testing.T) {
 
 	t.Run("setnx on existing key", func(t *testing.T) {
 		// First set
-		_, _ = client.SetNX(ctx, "nxkey2", "value1", 1*time.Hour).Result()
+		_, _ = client.SetArgs(ctx, "nxkey2", "value1", redis.SetArgs{Mode: "NX", TTL: 1 * time.Hour}).Result()
 
 		// Second set should fail
-		success, err := client.SetNX(ctx, "nxkey2", "value2", 1*time.Hour).Result()
-		if err != nil {
-			t.Errorf("SetNX() error = %v", err)
+		_, err := client.SetArgs(ctx, "nxkey2", "value2", redis.SetArgs{Mode: "NX", TTL: 1 * time.Hour}).Result()
+		if err != nil && err != redis.Nil {
+			t.Errorf("SetArgs() with NX error = %v", err)
 		}
+		success := (err == nil)
 		if success {
-			t.Error("SetNX() on existing key = true, want false")
+			t.Error("SetArgs() with NX on existing key = true, want false")
 		}
 
 		// Value should be unchanged
@@ -171,18 +173,19 @@ func TestMockRedis_SetNX(t *testing.T) {
 
 	t.Run("setnx on expired key", func(t *testing.T) {
 		// Set with short TTL
-		_, _ = client.SetNX(ctx, "nxkey3", "value1", 50*time.Millisecond).Result()
+		_, _ = client.SetArgs(ctx, "nxkey3", "value1", redis.SetArgs{Mode: "NX", TTL: 50 * time.Millisecond}).Result()
 
 		// Wait for expiration
 		time.Sleep(100 * time.Millisecond)
 
-		// SetNX should succeed on expired key
-		success, err := client.SetNX(ctx, "nxkey3", "value2", 1*time.Hour).Result()
+		// SetArgs with NX should succeed on expired key
+		_, err := client.SetArgs(ctx, "nxkey3", "value2", redis.SetArgs{Mode: "NX", TTL: 1 * time.Hour}).Result()
 		if err != nil {
-			t.Errorf("SetNX() on expired key error = %v", err)
+			t.Errorf("SetArgs() with NX on expired key error = %v", err)
 		}
+		success := (err == nil)
 		if !success {
-			t.Error("SetNX() on expired key = false, want true")
+			t.Error("SetArgs() with NX on expired key = false, want true")
 		}
 	})
 }
