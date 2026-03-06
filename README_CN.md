@@ -197,7 +197,7 @@ go tool cover -func=coverage.out
 
 ## 环境要求
 
-- Go 1.25 或更高版本
+- Go 1.26 或更高版本
 - Redis 服务器（测试时可选，提供 Mock Redis）
 
 ## 完整示例：带限流的缓存与锁

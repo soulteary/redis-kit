@@ -179,7 +179,7 @@ redis-kit/
 
 ## Requirements
 
-- Go 1.25 or later
+- Go 1.26 or later
 - Redis server (optional for testing, mock Redis is provided)
 
 ## Test Coverage
