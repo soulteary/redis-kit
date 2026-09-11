@@ -184,15 +184,18 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	return nil
 }
 
-// maxWholeMillis is the largest time.Duration that is an exact number of
+// maxRoundedTTL is the largest time.Duration that is an exact number of
 // milliseconds.
-const maxWholeMillis = time.Duration(math.MaxInt64 - math.MaxInt64%int64(time.Millisecond))
+//
+// Not named for its unit: staticcheck's ST1011 rejects a unit-specific suffix
+// on a time.Duration.
+const maxRoundedTTL = time.Duration(math.MaxInt64 - math.MaxInt64%int64(time.Millisecond))
 
 // roundUpMillis rounds a positive duration up to a whole millisecond, the
 // granularity Redis TTLs actually have.
 //
 // Near the top of the range there is nothing to round up TO, so it saturates
-// at maxWholeMillis instead -- rounding DOWN by under a millisecond, which for
+// at maxRoundedTTL instead -- rounding DOWN by under a millisecond, which for
 // a lease is the safe direction. Adding blindly overflowed to a negative
 // duration, and the common time.Duration(math.MaxInt64) sentinel is exactly
 // such a value: Acquire then passed a non-positive TTL, which go-redis omits
@@ -207,8 +210,8 @@ func roundUpMillis(d time.Duration) time.Duration {
 	if rem == 0 {
 		return d
 	}
-	if d > maxWholeMillis {
-		return maxWholeMillis
+	if d > maxRoundedTTL {
+		return maxRoundedTTL
 	}
 	return d + (time.Millisecond - rem)
 }
