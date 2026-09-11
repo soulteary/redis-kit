@@ -625,3 +625,86 @@ func TestFallbackKeyIsNotReissuedThroughRedis(t *testing.T) {
 		t.Error("the fallback holder's Unlock deleted the Redis holder's lock")
 	}
 }
+
+// TestRedisHeldKeyIsNotGrantedLocally is the regression test for the REVERSE
+// transition of the round-3 fix: a key taken through Redis, with Redis then
+// becoming unavailable before it is released.
+//
+// The second Lock found no fallback record, got a Redis error, and took the
+// local lock -- two callers in one critical section. Worse, the record is
+// keyed by KEY, so the Redis holder's own Unlock then found the local marker
+// and released the SECOND caller's lock.
+func TestRedisHeldKeyIsNotGrantedLocally(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	h := NewHybridLockerWithLocalFallback(client)
+
+	// Taken through a healthy Redis.
+	ok, err := h.Lock("k")
+	if err != nil || !ok {
+		t.Fatalf("Lock through Redis = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// Redis goes away while that lease is still held.
+	dead := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer func() { _ = dead.Close() }()
+	h.redisLocker = NewRedisLocker(dead)
+
+	if ok, _ := h.Lock("k"); ok {
+		t.Error("a key held through Redis was granted again through the local fallback")
+	}
+
+	// A DIFFERENT key may still degrade -- that is what the mode is for.
+	if ok, err := h.Lock("other"); err != nil || !ok {
+		t.Errorf("Lock of an unheld key during the outage = (%v, %v), want the fallback to grant it", ok, err)
+	}
+}
+
+// TestLegacyQueueFollowsRedisOrder is the regression test for enqueueing
+// outside the SET. Apart, the queue is ordered by reply completion rather than
+// by Redis execution, so a delayed reply could file the LATER acquisition
+// first and the earlier caller's Unlock -- which takes the oldest entry --
+// would pop the live token of the one still working.
+func TestLegacyQueueFollowsRedisOrder(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	locker := NewRedisLocker(client)
+	locker.lockTime = 50 * time.Millisecond
+
+	// Two acquisitions of one key straddling the lease, concurrently.
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for attempt := 0; attempt < 40; attempt++ {
+				if ok, err := locker.Lock("k"); err == nil && ok {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// However the replies interleaved, every recorded entry must be in
+	// non-decreasing expiry order: that is what makes "oldest first" mean
+	// "the earliest acquisition".
+	locker.mu.Lock()
+	q := locker.lockStore["k"]
+	locker.mu.Unlock()
+	if q == nil || len(q.entries) < 2 {
+		t.Skipf("only %d acquisitions recorded; the lease did not elapse between them", len(q.entries))
+	}
+	for i := 1; i < len(q.entries); i++ {
+		if q.entries[i].expires.Before(q.entries[i-1].expires) {
+			t.Errorf("entry %d expires before entry %d; the queue is not in acquisition order", i, i-1)
+		}
+	}
+}

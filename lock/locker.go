@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -26,6 +27,10 @@ type RedisLocker struct {
 
 	// mu guards lockStore.
 	mu sync.Mutex
+
+	// acquireMu serialises the SET with the enqueue that records it, per key,
+	// so the queue's order is Redis's execution order.
+	acquireMu keyedMutex
 
 	// lockStore maps key -> the outstanding acquisitions for that key, for the
 	// legacy Lock/Unlock pair -- which identifies a lock by key alone and so
@@ -116,6 +121,15 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
 	defer cancel()
+
+	// The SET and the enqueue below are one operation per key. Apart, the
+	// queue is ordered by REPLY COMPLETION rather than by Redis execution: A's
+	// SET can succeed and have its reply delayed past the lease, B can then
+	// acquire and reply first, and the queue records B before A. A's Unlock --
+	// which takes the OLDEST entry -- would then pop B's live token and delete
+	// a lock B is still holding.
+	release := r.acquireMu.lock(key)
+	defer release()
 
 	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
 	if err != nil && err != redis.Nil {
@@ -235,20 +249,37 @@ type HybridLocker struct {
 	localLocker        *LocalLocker
 	allowLocalFallback bool
 
-	// fallbackMu guards localFallbacks AND serialises the whole Lock/Unlock
-	// decision while the fallback is enabled, so a key cannot be acquired
-	// through both backends at once.
+	// fallbackMu guards heldBy AND serialises the whole Lock/Unlock decision
+	// while the fallback is enabled, so a key cannot be acquired through both
+	// backends at once.
 	fallbackMu sync.Mutex
-	// localFallbacks holds the keys currently held through the local lock
-	// because Redis was failing.
-	localFallbacks map[string]struct{}
+	// heldBy records which backend holds each key this locker has acquired
+	// and not yet released.
+	heldBy map[string]lockBackend
 }
+
+// lockBackend identifies which locker an acquisition came from.
+type lockBackend int
+
+const (
+	backendNone lockBackend = iota
+	backendRedis
+	backendLocal
+)
 
 // fallbackActive reports whether this locker can hold a key through the local
 // lock while also talking to Redis -- the only configuration in which an
 // unlock has two possible destinations.
 func (h *HybridLocker) fallbackActive() bool {
 	return h.redisLocker != nil && h.allowLocalFallback
+}
+
+// record notes which backend holds key. Callers hold fallbackMu.
+func (h *HybridLocker) record(key string, backend lockBackend) {
+	if h.heldBy == nil {
+		h.heldBy = make(map[string]lockBackend)
+	}
+	h.heldBy[key] = backend
 }
 
 // NewHybridLocker creates a hybrid locker that uses Redis when client is
@@ -295,23 +326,40 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 		h.fallbackMu.Lock()
 		defer h.fallbackMu.Unlock()
 
-		if _, held := h.localFallbacks[key]; !held {
+		switch h.heldBy[key] {
+		case backendLocal:
+			// A local fallback is outstanding. Do not hand the key out
+			// through Redis: that is a second holder in the same critical
+			// section. The local locker refuses it, which is the answer.
+			return h.localLocker.Lock(key)
+
+		case backendRedis:
+			// A Redis acquisition is outstanding. Never degrade to the local
+			// lock for THIS key, even now that Redis is unreachable -- the
+			// Redis holder is still running. Refusing costs availability for
+			// one key; degrading would put two callers inside it.
 			success, err := h.redisLocker.Lock(key)
 			if err == nil {
 				return success, nil
 			}
+			return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
+
+		default:
+			success, err := h.redisLocker.Lock(key)
+			if err == nil {
+				if success {
+					h.record(key, backendRedis)
+				}
+				return success, nil
+			}
 			// Explicitly opted in: mutual exclusion across instances is now
 			// lost.
-		}
-
-		success, err := h.localLocker.Lock(key)
-		if success && err == nil {
-			if h.localFallbacks == nil {
-				h.localFallbacks = make(map[string]struct{})
+			success, err = h.localLocker.Lock(key)
+			if success && err == nil {
+				h.record(key, backendLocal)
 			}
-			h.localFallbacks[key] = struct{}{}
+			return success, err
 		}
-		return success, err
 	}
 
 	if h.redisLocker != nil {
@@ -337,15 +385,28 @@ func (h *HybridLocker) Unlock(key string) error {
 		h.fallbackMu.Lock()
 		defer h.fallbackMu.Unlock()
 
-		if _, held := h.localFallbacks[key]; held {
-			delete(h.localFallbacks, key)
+		switch h.heldBy[key] {
+		case backendLocal:
+			delete(h.heldBy, key)
 			return h.localLocker.Unlock(key)
+
+		case backendRedis:
+			err := h.redisLocker.Unlock(key)
+			// Forget the key once the answer is definitive -- released, or
+			// no longer ours. An unreachable Redis is NOT definitive: the
+			// lease may still be held there, so the record stays and no
+			// local fallback is granted for it.
+			if err == nil || !errors.Is(err, ErrRedisUnavailable) {
+				delete(h.heldBy, key)
+			}
+			return err
+
+		default:
+			// Nothing recorded: this locker never took the key. Ask Redis,
+			// which will say so, and never reach for the local lock -- that
+			// would release a lock this caller never held.
+			return h.redisLocker.Unlock(key)
 		}
-		// Not recorded as a fallback, so it was taken through Redis. Release
-		// it there and nowhere else, even if Redis is unreachable: the lease
-		// expires on its own, and reaching for the local lock instead would
-		// release a lock this caller never took.
-		return h.redisLocker.Unlock(key)
 	}
 
 	if h.redisLocker != nil {
@@ -393,4 +454,43 @@ func (r *RedisLocker) trackedKeys() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.lockStore)
+}
+
+// keyedMutex serialises operations per key without serialising across keys.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*keyedEntry
+}
+
+type keyedEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock blocks until key is free and returns the function that releases it.
+// The per-key entry is dropped once nobody is waiting on it, so the map does
+// not grow with the key space.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = make(map[string]*keyedEntry)
+	}
+	e := k.m[key]
+	if e == nil {
+		e = &keyedEntry{}
+		k.m[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		k.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
 }
