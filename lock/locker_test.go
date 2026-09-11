@@ -193,7 +193,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 		// Manually set a different lock value in locker2's lockStore to simulate mismatch
 		// Then try to unlock - should fail because lock value doesn't match
-		locker2.lockStore.Store(key, "wrong-value")
+		locker2.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 
 		// Try to unlock with locker2 (different lock value)
 		err := locker2.Unlock(key)
@@ -252,8 +252,10 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		if err == nil {
 			t.Log("Unlock() on expired lock succeeded (lock may have been auto-expired)")
 		}
-		if err != nil && !errors.Is(err, ErrLockValueMismatch) && !errors.Is(err, ErrLockNotHeld) {
-			t.Errorf("Unlock() on expired lock error = %v, want mismatch or not held", err)
+		// An elapsed lease is reported as ErrLockExpired and, crucially, without
+		// issuing the delete: the key may already belong to a later holder.
+		if err != nil && !errors.Is(err, ErrLockExpired) && !errors.Is(err, ErrLockValueMismatch) && !errors.Is(err, ErrLockNotHeld) {
+			t.Errorf("Unlock() on expired lock error = %v, want expired, mismatch or not held", err)
 		}
 	})
 
@@ -355,8 +357,10 @@ func TestHybridLocker(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to local lock when Redis unavailable", func(t *testing.T) {
-		// Create a client that will fail operations
+	// A Redis outage must not be answered with a process-local lock by default.
+	// Doing so drops mutual exclusion between instances while reporting
+	// (true, nil), which is indistinguishable from a real distributed lock.
+	t.Run("reports the Redis failure instead of degrading to a local lock", func(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
@@ -365,19 +369,38 @@ func TestHybridLocker(t *testing.T) {
 		locker := NewHybridLocker(client)
 		key := "test-lock"
 
-		// Should fall back to local lock
+		success, err := locker.Lock(key)
+		if err == nil {
+			t.Error("HybridLocker.Lock() with failed Redis returned nil error; the caller cannot fail closed")
+		}
+		if !errors.Is(err, ErrRedisUnavailable) {
+			t.Errorf("HybridLocker.Lock() error = %v, want ErrRedisUnavailable", err)
+		}
+		if success {
+			t.Error("HybridLocker.Lock() with failed Redis = true; no lock was actually taken anywhere")
+		}
+	})
+
+	// The previous behaviour stays available for callers that genuinely accept
+	// losing exclusion, but it has to be asked for by name.
+	t.Run("opt-in local fallback still works", func(t *testing.T) {
+		client := redis.NewClient(&redis.Options{
+			Addr: "invalid:6379",
+		})
+		defer func() { _ = client.Close() }()
+
+		locker := NewHybridLockerWithLocalFallback(client)
+		key := "test-lock"
+
 		success, err := locker.Lock(key)
 		if err != nil {
-			t.Errorf("HybridLocker.Lock() with failed Redis error = %v, want nil (should fallback)", err)
+			t.Errorf("opt-in fallback Lock() error = %v, want nil", err)
 		}
 		if !success {
-			t.Error("HybridLocker.Lock() with failed Redis = false, want true (local lock should work)")
+			t.Error("opt-in fallback Lock() = false, want true")
 		}
-
-		// Should be able to unlock via local lock
-		err = locker.Unlock(key)
-		if err != nil {
-			t.Errorf("HybridLocker.Unlock() error = %v, want nil", err)
+		if err := locker.Unlock(key); err != nil {
+			t.Errorf("opt-in fallback Unlock() error = %v, want nil", err)
 		}
 	})
 
@@ -435,7 +458,7 @@ func TestHybridLocker(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
-		locker := NewHybridLocker(client)
+		locker := NewHybridLockerWithLocalFallback(client)
 		key := "test-lock"
 
 		// Lock via local (by making Redis fail)
@@ -462,7 +485,7 @@ func TestHybridLocker(t *testing.T) {
 
 		// Simulate another locker instance trying to unlock (wrong value in store)
 		locker2 := NewRedisLocker(client)
-		locker2.lockStore.Store(key, "wrong-value")
+		locker2.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		// Unlock with locker2 fails with "lock value mismatch or lock has expired"
 		err2 := locker2.Unlock(key)
 		if err2 == nil {
@@ -475,7 +498,7 @@ func TestHybridLocker(t *testing.T) {
 		hl := NewHybridLocker(client)
 		_, _ = hl.Lock(key) // now hl holds the lock
 		// Corrupt: make Redis think we have different value so Eval returns 0
-		hl.redisLocker.lockStore.Store(key, "wrong-value")
+		hl.redisLocker.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		err := hl.Unlock(key)
 		// Should return the mismatch error, not fall back to local
 		if err == nil {

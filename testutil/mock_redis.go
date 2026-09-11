@@ -346,6 +346,32 @@ func (m *MockRedis) handleEval(args []string, w *bufio.Writer) error {
 	key := args[3]
 	argv := args[3+numKeys:]
 
+	// Handle the extend script: if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end
+	if strings.Contains(script, "redis-kit:lock-extend") {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		if len(argv) < 2 {
+			return writeError(w, "invalid args")
+		}
+		ttlMs, err := strconv.ParseInt(argv[1], 10, 64)
+		if err != nil {
+			return writeError(w, "invalid ttl")
+		}
+		val, ok := m.data[key]
+		if !ok || val.value != argv[0] {
+			return writeInt(w, 0)
+		}
+		if val.expiresAt != nil && time.Now().After(*val.expiresAt) {
+			delete(m.data, key)
+			return writeInt(w, 0)
+		}
+		exp := time.Now().Add(time.Duration(ttlMs) * time.Millisecond)
+		val.expiresAt = &exp
+		m.data[key] = val
+		return writeInt(w, 1)
+	}
+
 	// Handle the unlock script: if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end
 	if strings.Contains(script, "get") && strings.Contains(script, "del") {
 		m.mu.Lock()

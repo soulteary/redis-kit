@@ -2,9 +2,11 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/soulteary/redis-kit/testutil"
 )
 
@@ -816,4 +818,29 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestGetMissIsClassifiable: a miss must be distinguishable from a backend
+// failure without matching on the error text.
+func TestGetMissIsClassifiable(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "t:")
+	var out string
+	err := c.Get(context.Background(), "absent", &out)
+
+	if err == nil {
+		t.Fatal("Get() on a missing key returned nil error")
+	}
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("errors.Is(err, ErrKeyNotFound) = false for %v", err)
+	}
+	if !errors.Is(err, redis.Nil) {
+		t.Errorf("errors.Is(err, redis.Nil) = false for %v", err)
+	}
+	// The original message shape is preserved for existing callers.
+	if err.Error() != "key not found: absent" {
+		t.Errorf("Error() = %q, want %q", err.Error(), "key not found: absent")
+	}
 }

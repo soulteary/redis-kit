@@ -3,11 +3,32 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// ErrKeyNotFound is returned by Get when the key is absent or has expired.
+//
+// It wraps redis.Nil, so both errors.Is(err, cache.ErrKeyNotFound) and
+// errors.Is(err, redis.Nil) classify a miss. Without a sentinel, callers had no
+// way to tell a miss from a backend failure except by matching on the error
+// text -- which is exactly what downstream code ended up doing.
+var ErrKeyNotFound = errors.New("key not found")
+
+// notFoundError reports a cache miss. It keeps the original
+// "key not found: <key>" message so callers that matched on the text keep
+// working, while errors.Is now classifies it as both ErrKeyNotFound and
+// redis.Nil.
+type notFoundError struct{ key string }
+
+func (e notFoundError) Error() string { return "key not found: " + e.key }
+
+func (e notFoundError) Is(target error) bool {
+	return target == ErrKeyNotFound || target == redis.Nil
+}
 
 // RedisCache provides a Redis-based cache implementation
 type RedisCache struct {
@@ -63,8 +84,8 @@ func (c *RedisCache) Get(ctx context.Context, key string, dest interface{}) erro
 
 	// Get from Redis
 	data, err := c.client.Get(ctx, fullKey).Bytes()
-	if err == redis.Nil {
-		return fmt.Errorf("key not found: %s", key)
+	if errors.Is(err, redis.Nil) {
+		return notFoundError{key: key}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get cache: %w", err)
