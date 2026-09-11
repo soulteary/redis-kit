@@ -293,6 +293,9 @@ func TestHandleExpiryIsMeasuredFromTheCommand(t *testing.T) {
 	if h.ExpiresAt().After(after.Add(2 * time.Second)) {
 		t.Errorf("ExpiresAt %s after Extend is later than reply+ttl %s", h.ExpiresAt(), after.Add(2*time.Second))
 	}
+	if h.ExpiresAt().Before(before.Add(2 * time.Second)) {
+		t.Errorf("ExpiresAt %s after Extend is earlier than issue+ttl %s", h.ExpiresAt(), before.Add(2*time.Second))
+	}
 
 	_ = h.Release(context.Background())
 }
