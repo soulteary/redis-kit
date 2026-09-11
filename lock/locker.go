@@ -28,9 +28,9 @@ type RedisLocker struct {
 	// mu guards lockStore.
 	mu sync.Mutex
 
-	// lockStore maps key -> the outstanding acquisitions for that key, OLDEST
-	// FIRST, for the legacy Lock/Unlock pair -- which identifies a lock by key
-	// alone and so has nowhere else to keep the token.
+	// lockStore maps key -> the outstanding acquisitions for that key, for the
+	// legacy Lock/Unlock pair -- which identifies a lock by key alone and so
+	// has nowhere else to keep the token.
 	//
 	// A queue rather than a single entry, because the same locker can acquire
 	// a key again after its lease elapses: storing only the latest let the
@@ -41,7 +41,22 @@ type RedisLocker struct {
 	//
 	// Prefer Acquire, which hands the token to the caller in a Handle and does
 	// not use this map at all.
-	lockStore map[string][]lockEntry
+	lockStore map[string]*keyQueue
+}
+
+// keyQueue is the outstanding acquisitions for one key, oldest first.
+type keyQueue struct {
+	entries []lockEntry
+
+	// tombstones counts acquisitions dropped by the cap.
+	//
+	// Their callers can still call Unlock, and simply discarding the entries
+	// would shift every later caller onto somebody else's acquisition -- after
+	// enough late unlocks a stale caller would reach the newest, still-live
+	// token and compare-and-delete the current holder's lock. Each tombstone
+	// absorbs exactly one Unlock, reporting ErrLockExpired, so the
+	// caller-to-acquisition correspondence survives capping.
+	tombstones int
 }
 
 // lockEntry is one legacy acquisition: its token and when its lease elapses.
@@ -75,7 +90,7 @@ func NewRedisLockerWithLockTime(client *redis.Client, lockTime time.Duration) *R
 	return &RedisLocker{
 		client:    client,
 		lockTime:  lockTime,
-		lockStore: make(map[string][]lockEntry),
+		lockStore: make(map[string]*keyQueue),
 	}
 }
 
@@ -122,23 +137,45 @@ func (r *RedisLocker) takeOldest(key string) (lockEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	queue := r.lockStore[key]
-	if len(queue) == 0 {
+	q := r.lockStore[key]
+	if q == nil {
 		return lockEntry{}, false
 	}
 
-	entry := queue[0]
-	if len(queue) == 1 {
-		// Balanced usage leaves nothing behind.
+	var entry lockEntry
+	switch {
+	case q.tombstones > 0:
+		// A capped acquisition: absorb this Unlock without touching Redis.
+		// entry's zero expiry is already in the past, so the caller gets
+		// ErrLockExpired.
+		q.tombstones--
+	case len(q.entries) > 0:
+		entry = q.entries[0]
+		q.entries = q.entries[1:]
+	default:
+		return lockEntry{}, false
+	}
+
+	// Balanced usage leaves nothing behind.
+	if q.tombstones == 0 && len(q.entries) == 0 {
 		delete(r.lockStore, key)
-	} else {
-		r.lockStore[key] = queue[1:]
 	}
 	return entry, true
 }
 
-// Unlock releases a distributed lock using a Lua script to ensure atomicity
-// Only releases the lock if the lock value matches, preventing accidental release of another process's lock
+// Unlock releases a distributed lock using a Lua script to ensure atomicity.
+// Only releases the lock if the lock value matches, preventing accidental
+// release of another process's lock.
+//
+// It consumes the OLDEST outstanding acquisition of key, which is this
+// caller's own in the paired usage this API assumes. The key alone cannot
+// identify the caller, so when two holders of one key finish out of order --
+// the second one's lease outliving the first's -- the second's Unlock takes
+// the first's expired entry, reports ErrLockExpired, and leaves its own lock
+// in place until the TTL elapses. That is the safe half of the trade: letting
+// an Unlock skip an expired entry to find a live one is exactly how a late
+// caller comes to delete a current holder's lock. Acquire returns a Handle
+// carrying its own token and has neither problem.
 func (r *RedisLocker) Unlock(key string) error {
 	if r.client == nil {
 		return fmt.Errorf("redis client is nil")
@@ -297,18 +334,29 @@ func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	queue := append(r.lockStore[key], entry)
-	if len(queue) > maxOutstandingPerKey {
-		queue = queue[len(queue)-maxOutstandingPerKey:]
+	q := r.lockStore[key]
+	if q == nil {
+		q = &keyQueue{}
+		r.lockStore[key] = q
 	}
-	r.lockStore[key] = queue
+
+	q.entries = append(q.entries, entry)
+	if over := len(q.entries) - maxOutstandingPerKey; over > 0 {
+		// Leave a tombstone per dropped entry rather than silently shifting
+		// later callers onto somebody else's acquisition.
+		q.entries = q.entries[over:]
+		q.tombstones += over
+	}
 }
 
 // outstanding reports how many acquisitions are recorded for key.
 func (r *RedisLocker) outstanding(key string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.lockStore[key])
+	if q := r.lockStore[key]; q != nil {
+		return len(q.entries) + q.tombstones
+	}
+	return 0
 }
 
 // trackedKeys reports how many keys have outstanding acquisitions recorded.

@@ -3,6 +3,7 @@ package lock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -323,4 +324,118 @@ func TestExtendRoundsUpSubMillisecondTTLs(t *testing.T) {
 	if err := h.Release(context.Background()); err != nil {
 		t.Errorf("Release() after a sub-millisecond Extend = %v; the lock was destroyed by PEXPIRE 0", err)
 	}
+}
+
+// --- Codex review round 2 (PR #3) ---
+
+// TestCappedQueueKeepsTombstones is the regression test for bounding the
+// legacy queue by discarding its oldest entries. Their callers can still call
+// Unlock, so dropping the entries outright shifted every later caller onto
+// somebody else's acquisition -- after enough late unlocks a stale caller
+// reaches the newest, still-live token and compare-and-deletes the current
+// holder's lock.
+//
+// The queue is driven directly: SET NX only succeeds once per key, so the
+// overflow this guards against comes from repeated acquisitions across
+// expired leases, not from a burst of concurrent Lock calls.
+func TestCappedQueueKeepsTombstones(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+	const key = "capped"
+	const extra = 5
+
+	for i := 0; i < maxOutstandingPerKey+extra; i++ {
+		l.storeEntry(key, lockEntry{token: fmt.Sprintf("tok-%d", i), expires: time.Now().Add(time.Hour)})
+	}
+
+	// Every outstanding acquisition is still accounted for: entries plus
+	// tombstones. Memory is capped; correspondence is not.
+	if got := l.outstanding(key); got != maxOutstandingPerKey+extra {
+		t.Fatalf("outstanding = %d, want %d: capping dropped acquisitions instead of tombstoning them",
+			got, maxOutstandingPerKey+extra)
+	}
+
+	// The first `extra` unlocks belong to the discarded acquisitions and are
+	// absorbed as expired, rather than consuming a later caller's entry.
+	for i := 0; i < extra; i++ {
+		if err := l.Unlock(key); !errors.Is(err, ErrLockExpired) {
+			t.Fatalf("Unlock %d = %v, want ErrLockExpired from a tombstone", i, err)
+		}
+	}
+
+	// The surviving entries are still there, in order, and the newest one --
+	// the acquisition that would actually hold the Redis lock -- is reached
+	// only by its own caller.
+	if got := l.outstanding(key); got != maxOutstandingPerKey {
+		t.Errorf("outstanding = %d after the tombstoned unlocks, want %d", got, maxOutstandingPerKey)
+	}
+
+	entry, ok := l.takeOldest(key)
+	if !ok {
+		t.Fatal("no entry left after the tombstones were consumed")
+	}
+	if entry.token != fmt.Sprintf("tok-%d", extra) {
+		t.Errorf("oldest surviving token = %q, want tok-%d: the queue shifted", entry.token, extra)
+	}
+}
+
+// TestExtendRoundsTTLUpToWholeMilliseconds: Redis TTLs are whole
+// milliseconds and go-redis truncates, so a 1.9ms lease was sent as 1ms while
+// the handle recorded 1.9ms -- overstating ownership by almost a millisecond.
+func TestExtendRoundsTTLUpToWholeMilliseconds(t *testing.T) {
+	if got, want := roundUpMillis(1900*time.Microsecond), 2*time.Millisecond; got != want {
+		t.Errorf("roundUpMillis(1.9ms) = %s, want %s", got, want)
+	}
+	if got, want := roundUpMillis(100*time.Microsecond), time.Millisecond; got != want {
+		t.Errorf("roundUpMillis(100µs) = %s, want %s", got, want)
+	}
+	if got, want := roundUpMillis(2*time.Millisecond), 2*time.Millisecond; got != want {
+		t.Errorf("roundUpMillis(2ms) = %s, want %s (already whole)", got, want)
+	}
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+	h, err := l.Acquire(context.Background(), "rounding", 1900*time.Microsecond)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+
+	// The recorded deadline must not exceed what the server was told.
+	if remaining := time.Until(h.ExpiresAt()); remaining > 2*time.Millisecond {
+		t.Errorf("ExpiresAt is %s away, more than the rounded 2ms sent to Redis", remaining)
+	}
+	_ = h.Release(context.Background())
+}
+
+// TestHandleExpiryIsRaceFree exercises the renewal-heartbeat pattern the
+// Handle API exists to support: Extend writing the deadline while another
+// goroutine reads it through ExpiresAt. Run with -race.
+func TestHandleExpiryIsRaceFree(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+	h, err := l.Acquire(context.Background(), "heartbeat", time.Minute)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = h.Extend(context.Background(), time.Minute)
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		_ = h.ExpiresAt()
+	}
+	<-done
+
+	_ = h.Release(context.Background())
 }

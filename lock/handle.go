@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -36,9 +37,15 @@ end
 // key alone and keep the token in a process-wide map, which cannot distinguish
 // two acquisitions of the same key.
 type Handle struct {
-	client  *redis.Client
-	key     string
-	token   string
+	client *redis.Client
+	key    string
+	token  string
+
+	// mu guards expires. Extend writes it while a worker goroutine reads it
+	// through ExpiresAt or Release -- the renewal-heartbeat pattern this API
+	// exists to support -- and time.Time is multiword, so an unsynchronized
+	// read can observe a torn deadline as well as tripping the race detector.
+	mu      sync.RWMutex
 	expires time.Time
 }
 
@@ -46,7 +53,11 @@ type Handle struct {
 func (h *Handle) Key() string { return h.key }
 
 // ExpiresAt returns when this lease elapses if it is not extended.
-func (h *Handle) ExpiresAt() time.Time { return h.expires }
+func (h *Handle) ExpiresAt() time.Time {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.expires
+}
 
 // Acquire takes the lock for key, holding it for ttl.
 //
@@ -76,6 +87,11 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	// another holder took the key. Erring early is the safe direction.
 	issued := time.Now()
 
+	// Redis TTLs are whole milliseconds and go-redis truncates, so a 1.9ms
+	// lease is really 1ms. Round UP and stamp the deadline from the rounded
+	// value, so ExpiresAt never claims ownership the server did not grant.
+	ttl = roundUpMillis(ttl)
+
 	err = l.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Err()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil // held by somebody else
@@ -102,7 +118,7 @@ func (h *Handle) Release(ctx context.Context) error {
 		return fmt.Errorf("%w: release %q: %v", ErrRedisUnavailable, h.key, err)
 	}
 	if n, ok := res.(int64); !ok || n == 0 {
-		if time.Now().After(h.expires) {
+		if time.Now().After(h.ExpiresAt()) {
 			return ErrLockExpired
 		}
 		return ErrLockValueMismatch
@@ -127,23 +143,40 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// PEXPIRE takes whole milliseconds, and any positive TTL under 1ms
 	// truncates to 0 -- which DELETES the key while reporting success, so
 	// Extend returned nil for a lease it had just destroyed. Round up.
-	millis := ttl.Milliseconds()
-	if millis < 1 {
-		millis = 1
-		ttl = time.Millisecond
-	}
+	// PEXPIRE takes whole milliseconds. Any positive TTL under 1ms truncates
+	// to 0 -- which DELETES the key while reporting success, so Extend
+	// returned nil for a lease it had just destroyed -- and the whole
+	// non-integral range truncates downwards, so a 1.9ms lease was recorded
+	// as 1.9ms while the server was given 1ms. Round UP, and stamp from the
+	// rounded value.
+	ttl = roundUpMillis(ttl)
 
 	// Same pre-command stamp as Acquire: Redis restarts the TTL when it runs
 	// PEXPIRE, so measuring from the reply overstates the new lease.
 	issued := time.Now()
 
-	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, millis).Result()
+	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, ttl.Milliseconds()).Result()
 	if err != nil {
 		return fmt.Errorf("%w: extend %q: %v", ErrRedisUnavailable, h.key, err)
 	}
 	if n, ok := res.(int64); !ok || n == 0 {
 		return ErrLockExpired
 	}
+
+	h.mu.Lock()
 	h.expires = issued.Add(ttl)
+	h.mu.Unlock()
 	return nil
+}
+
+// roundUpMillis rounds a positive duration up to a whole millisecond, the
+// granularity Redis TTLs actually have.
+func roundUpMillis(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	if rem := d % time.Millisecond; rem != 0 {
+		d += time.Millisecond - rem
+	}
+	return d
 }
