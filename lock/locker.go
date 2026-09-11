@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,16 +25,23 @@ type RedisLocker struct {
 	client   *redis.Client
 	lockTime time.Duration
 
-	// lockStore maps key -> lockEntry for the legacy Lock/Unlock pair, which
-	// identifies a lock by key alone and so has nowhere else to keep the token.
+	// mu guards lockStore.
+	mu sync.Mutex
+
+	// lockStore maps key -> the outstanding acquisitions for that key, OLDEST
+	// FIRST, for the legacy Lock/Unlock pair -- which identifies a lock by key
+	// alone and so has nowhere else to keep the token.
+	//
+	// A queue rather than a single entry, because the same locker can acquire
+	// a key again after its lease elapses: storing only the latest let the
+	// FIRST holder's Unlock consume the SECOND holder's token and
+	// compare-and-delete a lock it never held. Unlock takes the oldest
+	// outstanding entry, so each caller gets back its own acquisition and a
+	// late Unlock finds its own expired one.
+	//
 	// Prefer Acquire, which hands the token to the caller in a Handle and does
 	// not use this map at all.
-	lockStore sync.Map
-
-	// locksSinceSweep counts acquisitions since the last expired-entry sweep,
-	// so a process that acquires locks and never releases them (panic, early
-	// return, lease expiry) does not grow lockStore without bound.
-	locksSinceSweep atomic.Uint64
+	lockStore map[string][]lockEntry
 }
 
 // lockEntry is one legacy acquisition: its token and when its lease elapses.
@@ -51,8 +57,13 @@ type lockEntry struct {
 	expires time.Time
 }
 
-// sweepInterval is how many acquisitions pass between sweeps of lockStore.
-const sweepInterval = 256
+// maxOutstandingPerKey bounds the queue for one key.
+//
+// A balanced Lock/Unlock pair leaves an empty queue and the key is dropped, so
+// this only matters for a process that acquires and never releases (a panic,
+// an early return). Past the cap the oldest entry is discarded to bound
+// memory; a straggler Unlock for it then reports ErrLockNotHeld.
+const maxOutstandingPerKey = 1024
 
 // NewRedisLocker creates a new Redis-based distributed locker
 func NewRedisLocker(client *redis.Client) *RedisLocker {
@@ -62,8 +73,9 @@ func NewRedisLocker(client *redis.Client) *RedisLocker {
 // NewRedisLockerWithLockTime creates a new Redis-based distributed locker with custom lock time
 func NewRedisLockerWithLockTime(client *redis.Client, lockTime time.Duration) *RedisLocker {
 	return &RedisLocker{
-		client:   client,
-		lockTime: lockTime,
+		client:    client,
+		lockTime:  lockTime,
+		lockStore: make(map[string][]lockEntry),
 	}
 }
 
@@ -97,26 +109,32 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	}
 	res := (err == nil)
 	if res {
-		// Store the token together with the lease deadline for Unlock.
-		r.lockStore.Store(key, lockEntry{token: lockValue, expires: time.Now().Add(r.lockTime)})
-		if r.locksSinceSweep.Add(1)%sweepInterval == 0 {
-			r.sweepExpired()
-		}
+		// Append rather than replace: a previous holder of this key may not
+		// have unlocked yet, and its Unlock must find ITS entry, not this one.
+		r.storeEntry(key, lockEntry{token: lockValue, expires: time.Now().Add(r.lockTime)})
 	}
 
 	return res, nil
 }
 
-// sweepExpired drops lockStore entries whose lease has elapsed. Such an entry
-// can no longer release anything, so keeping it only leaks memory.
-func (r *RedisLocker) sweepExpired() {
-	now := time.Now()
-	r.lockStore.Range(func(key, value any) bool {
-		if entry, ok := value.(lockEntry); ok && now.After(entry.expires) {
-			r.lockStore.CompareAndDelete(key, value)
-		}
-		return true
-	})
+// takeOldest removes and returns the oldest outstanding acquisition for key.
+func (r *RedisLocker) takeOldest(key string) (lockEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	queue := r.lockStore[key]
+	if len(queue) == 0 {
+		return lockEntry{}, false
+	}
+
+	entry := queue[0]
+	if len(queue) == 1 {
+		// Balanced usage leaves nothing behind.
+		delete(r.lockStore, key)
+	} else {
+		r.lockStore[key] = queue[1:]
+	}
+	return entry, true
 }
 
 // Unlock releases a distributed lock using a Lua script to ensure atomicity
@@ -126,15 +144,11 @@ func (r *RedisLocker) Unlock(key string) error {
 		return fmt.Errorf("redis client is nil")
 	}
 
-	// Get stored lockValue
-	value, ok := r.lockStore.LoadAndDelete(key)
+	// Take the OLDEST outstanding acquisition for this key, which is this
+	// caller's own in the paired usage the legacy API assumes.
+	entry, ok := r.takeOldest(key)
 	if !ok {
 		return ErrLockNotHeld
-	}
-
-	entry, ok := value.(lockEntry)
-	if !ok {
-		return ErrLockValueType
 	}
 
 	// If our lease already elapsed, the key in Redis is either gone or held by
@@ -247,10 +261,21 @@ func (h *HybridLocker) Unlock(key string) error {
 		if err == nil {
 			return nil
 		}
-		// If Redis unlock fails due to lock value mismatch or lock expired,
-		// we should return the error instead of falling back to local lock
-		// Only fall back to local lock for connection/network errors
-		if errors.Is(err, ErrLockValueMismatch) || errors.Is(err, ErrLockValueType) {
+		// A verdict about a lock this locker DID hold is returned as-is;
+		// only an unreachable Redis may fall through to the local lock.
+		//
+		// ErrLockExpired used to fall through, and that was a lock-stealing
+		// path: a first holder whose Redis lease had elapsed, with Redis then
+		// failing and a second goroutine acquiring the same key through the
+		// local fallback, had its late Unlock release the SECOND goroutine's
+		// local lock.
+		//
+		// ErrLockNotHeld is deliberately NOT in this list: it means this
+		// locker has no Redis acquisition recorded for the key, which is
+		// exactly what a lock taken through the local fallback looks like.
+		if errors.Is(err, ErrLockValueMismatch) ||
+			errors.Is(err, ErrLockValueType) ||
+			errors.Is(err, ErrLockExpired) {
 			return err
 		}
 		// For other errors (e.g., connection failures), try local unlock
@@ -262,4 +287,33 @@ func (h *HybridLocker) Unlock(key string) error {
 
 	// Fall back to local lock
 	return h.localLocker.Unlock(key)
+}
+
+// storeEntry records an acquisition for key, oldest first.
+//
+// Only Lock and the package's own tests use it; callers identify a lock by
+// key alone through the legacy API and have nothing to pass here.
+func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	queue := append(r.lockStore[key], entry)
+	if len(queue) > maxOutstandingPerKey {
+		queue = queue[len(queue)-maxOutstandingPerKey:]
+	}
+	r.lockStore[key] = queue
+}
+
+// outstanding reports how many acquisitions are recorded for key.
+func (r *RedisLocker) outstanding(key string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.lockStore[key])
+}
+
+// trackedKeys reports how many keys have outstanding acquisitions recorded.
+func (r *RedisLocker) trackedKeys() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.lockStore)
 }

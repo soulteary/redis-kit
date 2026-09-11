@@ -193,7 +193,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 		// Manually set a different lock value in locker2's lockStore to simulate mismatch
 		// Then try to unlock - should fail because lock value doesn't match
-		locker2.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
+		locker2.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 
 		// Try to unlock with locker2 (different lock value)
 		err := locker2.Unlock(key)
@@ -289,18 +289,13 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		locker := NewRedisLocker(client)
 		key := "test-lock"
 
-		// Lock first to have key in Redis
+		// lockStore is now a typed []lockEntry, so a wrongly-typed entry
+		// cannot be represented and Unlock can no longer return
+		// ErrLockValueType. The sentinel stays exported, and HybridLocker
+		// still refuses to fall back on it, for callers matching on it.
 		_, _ = locker.Lock(key)
-
-		// Corrupt lockStore: store non-string value (simulate type assertion failure)
-		locker.lockStore.Store(key, 123)
-
-		err := locker.Unlock(key)
-		if err == nil {
-			t.Error("Unlock() with non-string lock value should return error")
-		}
-		if !errors.Is(err, ErrLockValueType) {
-			t.Errorf("Unlock() error = %v, want %v", err, ErrLockValueType)
+		if err := locker.Unlock(key); err != nil {
+			t.Errorf("Unlock() error = %v", err)
 		}
 	})
 }
@@ -485,7 +480,7 @@ func TestHybridLocker(t *testing.T) {
 
 		// Simulate another locker instance trying to unlock (wrong value in store)
 		locker2 := NewRedisLocker(client)
-		locker2.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
+		locker2.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		// Unlock with locker2 fails with "lock value mismatch or lock has expired"
 		err2 := locker2.Unlock(key)
 		if err2 == nil {
@@ -498,7 +493,7 @@ func TestHybridLocker(t *testing.T) {
 		hl := NewHybridLocker(client)
 		_, _ = hl.Lock(key) // now hl holds the lock
 		// Corrupt: make Redis think we have different value so Eval returns 0
-		hl.redisLocker.lockStore.Store(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
+		hl.redisLocker.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		err := hl.Unlock(key)
 		// Should return the mismatch error, not fall back to local
 		if err == nil {

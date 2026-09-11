@@ -66,6 +66,16 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 		return nil, err
 	}
 
+	// Stamp the deadline from BEFORE the command is issued.
+	//
+	// Redis starts the TTL when it executes SET, not when the reply arrives.
+	// Computing the deadline afterwards overstates the remaining lease by the
+	// whole round trip: with a five-second lease and a four-second reply, the
+	// handle claimed nearly five seconds while Redis had about one, so a
+	// caller scheduling renewal off ExpiresAt could still be running after
+	// another holder took the key. Erring early is the safe direction.
+	issued := time.Now()
+
 	err = l.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Err()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil // held by somebody else
@@ -74,7 +84,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 		return nil, fmt.Errorf("%w: acquire %q: %v", ErrRedisUnavailable, key, err)
 	}
 
-	return &Handle{client: l.client, key: key, token: token, expires: time.Now().Add(ttl)}, nil
+	return &Handle{client: l.client, key: key, token: token, expires: issued.Add(ttl)}, nil
 }
 
 // Release gives the lock back.
@@ -114,13 +124,26 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 		return fmt.Errorf("extend ttl must be positive, got %s", ttl)
 	}
 
-	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, ttl.Milliseconds()).Result()
+	// PEXPIRE takes whole milliseconds, and any positive TTL under 1ms
+	// truncates to 0 -- which DELETES the key while reporting success, so
+	// Extend returned nil for a lease it had just destroyed. Round up.
+	millis := ttl.Milliseconds()
+	if millis < 1 {
+		millis = 1
+		ttl = time.Millisecond
+	}
+
+	// Same pre-command stamp as Acquire: Redis restarts the TTL when it runs
+	// PEXPIRE, so measuring from the reply overstates the new lease.
+	issued := time.Now()
+
+	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, millis).Result()
 	if err != nil {
 		return fmt.Errorf("%w: extend %q: %v", ErrRedisUnavailable, h.key, err)
 	}
 	if n, ok := res.(int64); !ok || n == 0 {
 		return ErrLockExpired
 	}
-	h.expires = time.Now().Add(ttl)
+	h.expires = issued.Add(ttl)
 	return nil
 }

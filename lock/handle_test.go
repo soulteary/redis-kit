@@ -121,23 +121,36 @@ func TestLegacyUnlockDoesNotStealLaterLock(t *testing.T) {
 	}
 }
 
-// TestLockStoreIsSwept: entries whose lease elapsed can no longer release
-// anything, so they must not accumulate for the life of the process.
-func TestLockStoreIsSwept(t *testing.T) {
+// TestLockStoreDoesNotGrowUnbounded: the legacy store must not accumulate for
+// the life of the process. A balanced Lock/Unlock pair leaves nothing behind,
+// and an unbalanced one is capped.
+func TestLockStoreDoesNotGrowUnbounded(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
 	defer func() { _ = client.Close() }()
 
-	l := NewRedisLockerWithLockTime(client, time.Nanosecond)
-	for i := 0; i < sweepInterval+1; i++ {
-		if _, err := l.Lock(string(rune('a'+i%26)) + string(rune('a'+i/26))); err != nil {
+	// Balanced usage drops the key entirely.
+	l := NewRedisLocker(client)
+	for i := 0; i < 100; i++ {
+		if _, err := l.Lock("balanced"); err != nil {
+			t.Fatalf("Lock() error = %v", err)
+		}
+		if err := l.Unlock("balanced"); err != nil {
+			t.Fatalf("Unlock() error = %v", err)
+		}
+	}
+	if got := l.trackedKeys(); got != 0 {
+		t.Errorf("lockStore tracks %d keys after balanced use, want 0", got)
+	}
+
+	// Acquiring without releasing is capped rather than unbounded.
+	stale := NewRedisLockerWithLockTime(client, time.Nanosecond)
+	for i := 0; i < maxOutstandingPerKey+50; i++ {
+		if _, err := stale.Lock("leaky"); err != nil {
 			t.Fatalf("Lock() error = %v", err)
 		}
 	}
-
-	remaining := 0
-	l.lockStore.Range(func(_, _ any) bool { remaining++; return true })
-	if remaining > sweepInterval {
-		t.Errorf("lockStore holds %d expired entries after %d acquisitions; it is not being swept", remaining, sweepInterval+1)
+	if got := stale.outstanding("leaky"); got > maxOutstandingPerKey {
+		t.Errorf("lockStore holds %d entries for one key, want at most %d", got, maxOutstandingPerKey)
 	}
 }
 
@@ -201,5 +214,110 @@ func TestHandleOperationsOnRedisFailure(t *testing.T) {
 	}
 	if err := h.Release(ctx); !errors.Is(err, ErrRedisUnavailable) {
 		t.Errorf("Release() during a Redis failure = %v, want ErrRedisUnavailable", err)
+	}
+}
+
+// --- Codex review follow-ups (PR #3) ---
+
+// TestSameLockerReuseDoesNotStealALaterLock is the regression test for the
+// legacy store keeping only the LATEST entry per key. Reusing one RedisLocker
+// after a lease elapsed overwrote the first holder's token with the second's,
+// so the first holder's Unlock compare-and-deleted the SECOND holder's lock --
+// the exact stealing this store was added to prevent. The earlier regression
+// test missed it by using two separate RedisLocker instances.
+func TestSameLockerReuseDoesNotStealALaterLock(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	// One locker, short lease.
+	l := NewRedisLockerWithLockTime(client, 30*time.Millisecond)
+	const key = "shared"
+
+	if ok, err := l.Lock(key); err != nil || !ok {
+		t.Fatalf("first Lock = (%v, %v), want success", ok, err)
+	}
+
+	// The lease elapses and the Redis key goes with it.
+	time.Sleep(60 * time.Millisecond)
+
+	if ok, err := l.Lock(key); err != nil || !ok {
+		t.Fatalf("second Lock = (%v, %v), want success after expiry", ok, err)
+	}
+
+	// The FIRST holder releases late. It must get its own expired entry back,
+	// not the second holder's live one.
+	if err := l.Unlock(key); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("stale Unlock() = %v, want ErrLockExpired", err)
+	}
+
+	// The second holder still owns its lock and can release it.
+	if err := l.Unlock(key); err != nil {
+		t.Errorf("second holder Unlock() = %v; its lock was released by the stale Unlock", err)
+	}
+}
+
+// TestHandleExpiryIsMeasuredFromTheCommand is the regression test for stamping
+// the deadline after the reply arrived. Redis starts the TTL when it executes
+// SET, so measuring afterwards overstates the remaining lease by the whole
+// round trip -- a caller scheduling renewal off ExpiresAt could still be
+// running after another holder took the key.
+func TestHandleExpiryIsMeasuredFromTheCommand(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+
+	before := time.Now()
+	h, err := l.Acquire(context.Background(), "timing", time.Second)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+	after := time.Now()
+
+	// The deadline must be stamped from before the command, never from after
+	// the reply: erring early is the safe direction.
+	if h.ExpiresAt().After(after.Add(time.Second)) {
+		t.Errorf("ExpiresAt %s is later than reply+ttl %s; the lease is overstated",
+			h.ExpiresAt(), after.Add(time.Second))
+	}
+	if h.ExpiresAt().Before(before.Add(time.Second)) {
+		t.Errorf("ExpiresAt %s is earlier than issue+ttl %s", h.ExpiresAt(), before.Add(time.Second))
+	}
+
+	// Extend has the same rule.
+	before = time.Now()
+	if err := h.Extend(context.Background(), 2*time.Second); err != nil {
+		t.Fatalf("Extend() error = %v", err)
+	}
+	after = time.Now()
+	if h.ExpiresAt().After(after.Add(2 * time.Second)) {
+		t.Errorf("ExpiresAt %s after Extend is later than reply+ttl %s", h.ExpiresAt(), after.Add(2*time.Second))
+	}
+
+	_ = h.Release(context.Background())
+}
+
+// TestExtendRoundsUpSubMillisecondTTLs: PEXPIRE takes whole milliseconds, so
+// any positive TTL under 1ms truncated to 0 -- which DELETES the key while
+// reporting success, and Extend returned nil for a lease it had just
+// destroyed.
+func TestExtendRoundsUpSubMillisecondTTLs(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+	h, err := l.Acquire(context.Background(), "subms", time.Minute)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+
+	if err := h.Extend(context.Background(), 100*time.Microsecond); err != nil {
+		t.Fatalf("Extend(100µs) error = %v", err)
+	}
+
+	// The lock must still exist: a truncated PEXPIRE 0 would have deleted it
+	// while Extend reported success.
+	if err := h.Release(context.Background()); err != nil {
+		t.Errorf("Release() after a sub-millisecond Extend = %v; the lock was destroyed by PEXPIRE 0", err)
 	}
 }
