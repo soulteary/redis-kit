@@ -576,3 +576,52 @@ func TestRedisLocker_Concurrent(t *testing.T) {
 		}
 	})
 }
+
+// TestFallbackKeyIsNotReissuedThroughRedis is the regression test for a local
+// fallback acquisition being invisible to the Redis path.
+//
+// During an outage NewHybridLockerWithLocalFallback takes the key locally.
+// Once Redis recovers, a second Lock of the SAME key went to Redis and
+// succeeded -- two holders in one critical section -- and the first holder's
+// Unlock then tried Redis first and deleted the second holder's token while
+// leaving its own local lock behind.
+func TestFallbackKeyIsNotReissuedThroughRedis(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	// A client that cannot connect: the acquisition below degrades to local.
+	dead := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer func() { _ = dead.Close() }()
+
+	h := NewHybridLockerWithLocalFallback(dead)
+
+	ok, err := h.Lock("k")
+	if err != nil || !ok {
+		t.Fatalf("Lock during the outage = (%v, %v), want (true, nil) from the local fallback", ok, err)
+	}
+
+	// Redis comes back.
+	h.redisLocker = NewRedisLocker(client)
+
+	if ok, _ := h.Lock("k"); ok {
+		t.Error("a key held through the local fallback was handed out again via Redis")
+	}
+
+	// Someone else takes the key in Redis. The fallback holder's Unlock must
+	// not touch it.
+	other := NewRedisLocker(client)
+	if ok, err := other.Lock("k"); err != nil || !ok {
+		t.Fatalf("the Redis holder could not take the key: (%v, %v)", ok, err)
+	}
+
+	if err := h.Unlock("k"); err != nil {
+		t.Errorf("Unlock of the fallback acquisition = %v, want nil", err)
+	}
+	if ok, _ := other.Lock("k"); ok {
+		t.Error("the fallback holder's Unlock deleted the Redis holder's lock")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -438,4 +439,35 @@ func TestHandleExpiryIsRaceFree(t *testing.T) {
 	<-done
 
 	_ = h.Release(context.Background())
+}
+
+// TestRoundUpMillisSaturates is the regression test for rounding up past the
+// end of the time.Duration range. time.Duration(math.MaxInt64) -- a common
+// "no deadline" sentinel -- has a sub-millisecond remainder, so adding the
+// rounding increment wrapped to a NEGATIVE duration: Acquire then passed a
+// non-positive TTL, which go-redis omits from SET entirely, creating a lock
+// with no expiry while the handle recorded a deadline in the past, and Extend
+// sent a negative PEXPIRE, which deletes the key and reports success.
+func TestRoundUpMillisSaturates(t *testing.T) {
+	got := roundUpMillis(time.Duration(math.MaxInt64))
+	if got <= 0 {
+		t.Errorf("roundUpMillis(MaxInt64) = %s, want a positive duration", got)
+	}
+	if got%time.Millisecond != 0 {
+		t.Errorf("roundUpMillis(MaxInt64) = %s, want a whole number of milliseconds", got)
+	}
+	if got > time.Duration(math.MaxInt64) {
+		t.Errorf("roundUpMillis(MaxInt64) = %s, want no more than the input", got)
+	}
+
+	// Ordinary values still round UP, never down.
+	if got := roundUpMillis(1900 * time.Microsecond); got != 2*time.Millisecond {
+		t.Errorf("roundUpMillis(1.9ms) = %s, want 2ms", got)
+	}
+	if got := roundUpMillis(500 * time.Nanosecond); got != time.Millisecond {
+		t.Errorf("roundUpMillis(500ns) = %s, want 1ms", got)
+	}
+	if got := roundUpMillis(2 * time.Millisecond); got != 2*time.Millisecond {
+		t.Errorf("roundUpMillis(2ms) = %s, want it unchanged", got)
+	}
 }

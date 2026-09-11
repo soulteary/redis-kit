@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -235,6 +234,21 @@ type HybridLocker struct {
 	redisLocker        *RedisLocker
 	localLocker        *LocalLocker
 	allowLocalFallback bool
+
+	// fallbackMu guards localFallbacks AND serialises the whole Lock/Unlock
+	// decision while the fallback is enabled, so a key cannot be acquired
+	// through both backends at once.
+	fallbackMu sync.Mutex
+	// localFallbacks holds the keys currently held through the local lock
+	// because Redis was failing.
+	localFallbacks map[string]struct{}
+}
+
+// fallbackActive reports whether this locker can hold a key through the local
+// lock while also talking to Redis -- the only configuration in which an
+// unlock has two possible destinations.
+func (h *HybridLocker) fallbackActive() bool {
+	return h.redisLocker != nil && h.allowLocalFallback
 }
 
 // NewHybridLocker creates a hybrid locker that uses Redis when client is
@@ -271,58 +285,73 @@ func NewHybridLockerWithLocalFallback(client *redis.Client) *HybridLocker {
 // Only a locker built with NewHybridLockerWithLocalFallback degrades to the
 // process-local lock instead.
 func (h *HybridLocker) Lock(key string) (bool, error) {
+	if h.fallbackActive() {
+		// Held for the whole decision, Redis call included. A key already
+		// held through the local fallback must not be handed out again via
+		// Redis the moment Redis recovers: that puts two holders in the
+		// critical section, and the local holder's Unlock then goes on to
+		// consume the Redis holder's token. Serialising costs throughput in a
+		// mode that has already given up cross-instance exclusion.
+		h.fallbackMu.Lock()
+		defer h.fallbackMu.Unlock()
+
+		if _, held := h.localFallbacks[key]; !held {
+			success, err := h.redisLocker.Lock(key)
+			if err == nil {
+				return success, nil
+			}
+			// Explicitly opted in: mutual exclusion across instances is now
+			// lost.
+		}
+
+		success, err := h.localLocker.Lock(key)
+		if success && err == nil {
+			if h.localFallbacks == nil {
+				h.localFallbacks = make(map[string]struct{})
+			}
+			h.localFallbacks[key] = struct{}{}
+		}
+		return success, err
+	}
+
 	if h.redisLocker != nil {
 		success, err := h.redisLocker.Lock(key)
 		if err == nil {
 			return success, nil
 		}
-		if !h.allowLocalFallback {
-			return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
-		}
-		// Explicitly opted in: mutual exclusion across instances is now lost.
+		return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
 	}
 
 	return h.localLocker.Lock(key)
 }
 
-// Unlock releases a lock, trying Redis first and falling back to local lock if Redis fails
+// Unlock releases a lock through the backend that acquired it.
+//
+// The routing is recorded, not guessed. Trying Redis first and falling back to
+// the local lock on error was a lock-stealing path in both directions: a
+// locally-acquired key was released by deleting whatever Redis held for it --
+// another goroutine's token, once Redis recovered -- and a Redis-acquired key
+// whose release failed went on to release whatever was held locally.
 func (h *HybridLocker) Unlock(key string) error {
-	// Try Redis first if available
-	if h.redisLocker != nil {
-		if !h.allowLocalFallback {
-			return h.redisLocker.Unlock(key)
+	if h.fallbackActive() {
+		h.fallbackMu.Lock()
+		defer h.fallbackMu.Unlock()
+
+		if _, held := h.localFallbacks[key]; held {
+			delete(h.localFallbacks, key)
+			return h.localLocker.Unlock(key)
 		}
-		// Check if this key was locked via Redis by checking if it exists in lockStore
-		// We can't directly check, so we try Redis unlock first
-		err := h.redisLocker.Unlock(key)
-		if err == nil {
-			return nil
-		}
-		// A verdict about a lock this locker DID hold is returned as-is;
-		// only an unreachable Redis may fall through to the local lock.
-		//
-		// ErrLockExpired used to fall through, and that was a lock-stealing
-		// path: a first holder whose Redis lease had elapsed, with Redis then
-		// failing and a second goroutine acquiring the same key through the
-		// local fallback, had its late Unlock release the SECOND goroutine's
-		// local lock.
-		//
-		// ErrLockNotHeld is deliberately NOT in this list: it means this
-		// locker has no Redis acquisition recorded for the key, which is
-		// exactly what a lock taken through the local fallback looks like.
-		if errors.Is(err, ErrLockValueMismatch) ||
-			errors.Is(err, ErrLockValueType) ||
-			errors.Is(err, ErrLockExpired) {
-			return err
-		}
-		// For other errors (e.g., connection failures), try local unlock
-		if localErr := h.localLocker.Unlock(key); localErr == nil {
-			return nil
-		}
-		return err
+		// Not recorded as a fallback, so it was taken through Redis. Release
+		// it there and nowhere else, even if Redis is unreachable: the lease
+		// expires on its own, and reaching for the local lock instead would
+		// release a lock this caller never took.
+		return h.redisLocker.Unlock(key)
 	}
 
-	// Fall back to local lock
+	if h.redisLocker != nil {
+		return h.redisLocker.Unlock(key)
+	}
+
 	return h.localLocker.Unlock(key)
 }
 

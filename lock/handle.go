@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -47,6 +48,17 @@ type Handle struct {
 	// read can observe a torn deadline as well as tripping the race detector.
 	mu      sync.RWMutex
 	expires time.Time
+
+	// extendMu serialises an Extend's Eval with the deadline that Eval
+	// publishes. mu alone only ordered the assignments: two goroutines
+	// extending the same handle issue their PEXPIREs on separate pooled
+	// connections, whose replies can arrive in a different order from the
+	// order Redis ran them, so an older long extension could publish its
+	// deadline after a newer short one had become the server's actual TTL --
+	// and ExpiresAt then promised ownership the lease no longer had.
+	//
+	// It is deliberately not mu: ExpiresAt must not wait on a network call.
+	extendMu sync.Mutex
 }
 
 // Key returns the locked key.
@@ -151,6 +163,9 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// rounded value.
 	ttl = roundUpMillis(ttl)
 
+	h.extendMu.Lock()
+	defer h.extendMu.Unlock()
+
 	// Same pre-command stamp as Acquire: Redis restarts the TTL when it runs
 	// PEXPIRE, so measuring from the reply overstates the new lease.
 	issued := time.Now()
@@ -169,14 +184,31 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	return nil
 }
 
+// maxWholeMillis is the largest time.Duration that is an exact number of
+// milliseconds.
+const maxWholeMillis = time.Duration(math.MaxInt64 - math.MaxInt64%int64(time.Millisecond))
+
 // roundUpMillis rounds a positive duration up to a whole millisecond, the
 // granularity Redis TTLs actually have.
+//
+// Near the top of the range there is nothing to round up TO, so it saturates
+// at maxWholeMillis instead -- rounding DOWN by under a millisecond, which for
+// a lease is the safe direction. Adding blindly overflowed to a negative
+// duration, and the common time.Duration(math.MaxInt64) sentinel is exactly
+// such a value: Acquire then passed a non-positive TTL, which go-redis omits
+// from SET altogether, creating a lock with no expiry at all while the handle
+// recorded a deadline in the past; Extend sent a negative PEXPIRE, which
+// deletes the key and reports success.
 func roundUpMillis(d time.Duration) time.Duration {
 	if d <= 0 {
 		return d
 	}
-	if rem := d % time.Millisecond; rem != 0 {
-		d += time.Millisecond - rem
+	rem := d % time.Millisecond
+	if rem == 0 {
+		return d
 	}
-	return d
+	if d > maxWholeMillis {
+		return maxWholeMillis
+	}
+	return d + (time.Millisecond - rem)
 }

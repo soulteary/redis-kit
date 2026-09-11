@@ -12,7 +12,7 @@ A unified Redis utility library for Go projects. This package provides common Re
 ## Features
 
 - **Client Management**: Unified Redis client initialization and configuration
-- **Distributed Locking**: Redis-based distributed locks with automatic fallback to local locks
+- **Distributed Locking**: Redis-based distributed locks, with an opt-in fallback to local locks
 - **Rate Limiting**: Flexible rate limiting with support for user/IP/destination-based limits
 - **Caching**: Generic cache interface with Redis implementation
 - **Health Checks**: Built-in health check functionality
@@ -73,14 +73,22 @@ if !success {
 // Release the lock
 defer locker.Unlock("my-lock-key")
 
-// Or use hybrid locker (auto-fallback to local lock)
+// Or use hybrid locker. It uses Redis when a client is given and a
+// process-local lock when client is nil. When Redis is merely FAILING it
+// returns lock.ErrRedisUnavailable rather than degrading, so the caller can
+// fail closed:
 hybridLocker := lock.NewHybridLocker(client)
+
+// Opt back in to the old degrade-to-local behaviour only where a second
+// concurrent holder is acceptable -- a cache warmer, never a payment:
+hybridLocker = lock.NewHybridLockerWithLocalFallback(client)
 success, err := hybridLocker.Lock("my-lock-key")
 ```
 
 **Notes**
 - `Unlock` requires the same process to hold the lock value; unlocking a key without a local lock value returns an error to avoid deleting someone else's lock.
-- `HybridLocker` falls back to a local lock only when Redis operations fail. In multi-instance deployments, avoid relying on local fallback unless you accept split-brain behavior.
+- `HybridLocker` does **not** fall back to a local lock when Redis fails. A process-local lock provides no mutual exclusion between instances, so degrading to it during an outage drops the guarantee at exactly the moment it matters, and the caller cannot tell the difference from the return value. `NewHybridLocker` returns `lock.ErrRedisUnavailable` instead.
+- `NewHybridLockerWithLocalFallback` restores the degrading behaviour explicitly. Mutual exclusion across instances is lost while the fallback is in effect, so use it only where a second concurrent holder is acceptable. A key held through the fallback is not handed out via Redis again until it is released, and its unlock is routed back to the local lock.
 
 ### Rate Limiting
 
