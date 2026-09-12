@@ -587,6 +587,14 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			if !errors.Is(err, ErrRedisUnavailable) {
 				return false, err
 			}
+			if c.redisExpired > 0 {
+				// Unlock identifies only a key, not its caller. If a local holder
+				// were admitted while an older Redis route remained, either
+				// caller's single Unlock could be mistaken for the other. Fail
+				// closed until the expired route is consumed; token-bearing Handle
+				// acquisitions do not have this ambiguity.
+				return false, fmt.Errorf("%w: %d expired Redis acquisition(s) for %q still await Unlock", ErrLockExpired, c.redisExpired, key)
+			}
 			// Explicitly opted in: mutual exclusion across instances is now lost.
 			success, err = h.localLocker.Lock(key)
 			if success && err == nil {

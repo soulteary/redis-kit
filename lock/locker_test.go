@@ -666,11 +666,11 @@ func TestRedisHeldKeyIsNotGrantedLocally(t *testing.T) {
 	}
 }
 
-// TestFallbackForgetsRedisCountsAfterTheirLeaseBound covers an abandoned
-// Redis-backed Hybrid acquisition. Its Redis TTL eventually makes overlap
-// impossible, so the bookkeeping count must not disable explicit local
-// fallback forever when Redis is later unavailable.
-func TestFallbackForgetsRedisCountsAfterTheirLeaseBound(t *testing.T) {
+// TestFallbackRequiresExpiredRedisRouteToBeConsumed covers an elapsed
+// Redis-backed Hybrid acquisition. Its lease no longer blocks Redis attempts,
+// but key-only Unlock cannot distinguish that caller from a later local one;
+// local fallback therefore remains closed until the FIFO route is consumed.
+func TestFallbackRequiresExpiredRedisRouteToBeConsumed(t *testing.T) {
 	client, mock := testutil.NewMockRedisClient()
 	defer func() { _ = client.Close() }()
 	h := NewHybridLockerWithLocalFallback(client)
@@ -698,16 +698,17 @@ func TestFallbackForgetsRedisCountsAfterTheirLeaseBound(t *testing.T) {
 
 	mock.SetShouldFail(true)
 	defer mock.SetShouldFail(false)
-	if ok, err := h.Lock("abandoned"); err != nil || !ok {
-		t.Fatalf("Lock after Redis lease bound = (%v, %v), want local fallback", ok, err)
+	if ok, err := h.Lock("abandoned"); ok || !errors.Is(err, ErrLockExpired) {
+		t.Fatalf("Lock with an unconsumed Redis route = (%v, %v), want fail-closed ErrLockExpired", ok, err)
 	}
-	// The original Redis caller can still arrive late. Its Unlock consumes the
-	// retained Redis route and must not release the newer local acquisition.
+	// The original Redis caller arrives late and consumes its own route without
+	// issuing a Redis command.
 	if err := h.Unlock("abandoned"); !errors.Is(err, ErrLockExpired) {
 		t.Errorf("stale Redis Unlock = %v, want ErrLockExpired", err)
 	}
-	if ok, err := h.localLocker.Lock("abandoned"); err != nil || ok {
-		t.Errorf("local lock after stale Redis Unlock = (%v, %v), want still held", ok, err)
+	// With the ambiguous route gone, explicit local fallback can recover.
+	if ok, err := h.Lock("abandoned"); err != nil || !ok {
+		t.Fatalf("Lock after consuming Redis route = (%v, %v), want local fallback", ok, err)
 	}
 	if err := h.Unlock("abandoned"); err != nil {
 		t.Errorf("local fallback Unlock = %v", err)
