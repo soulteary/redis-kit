@@ -236,44 +236,74 @@ func TestLockStoreDoesNotGrowUnbounded(t *testing.T) {
 	}
 }
 
-// TestLockStorePrunesExpiredDistinctKeys covers unbalanced legacy users with
-// high-cardinality keys. Fully expired queues have no live token left to
-// protect and are pruned when another key is recorded; a queue with a later
-// live acquisition retains its expired prefix for FIFO Unlock safety.
-func TestLockStorePrunesExpiredDistinctKeys(t *testing.T) {
-	l := NewRedisLocker(nil)
+// TestLockStoreBoundsDistinctKeysWithoutDroppingRoutes covers unbalanced
+// legacy users with high-cardinality keys. Expired routes cannot be deleted:
+// a late Unlock could otherwise consume a future acquisition of the same key.
+// Capacity is reserved before Redis SET, so the map stays bounded by refusing
+// a new distinct key rather than sacrificing that FIFO safety.
+func TestLockStoreBoundsDistinctKeysWithoutDroppingRoutes(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+	l := NewRedisLocker(client)
 	now := time.Now()
-	for i := 0; i < 100; i++ {
-		l.storeEntry(fmt.Sprintf("expired-%d", i), lockEntry{
+	for i := 0; i < maxTrackedLegacyKeys; i++ {
+		key := fmt.Sprintf("expired-%d", i)
+		reserved, err := l.reserveKeyQueue(key)
+		if err != nil || !reserved {
+			t.Fatalf("reserve key %d = (%v, %v), want (true, nil)", i, reserved, err)
+		}
+		l.storeEntry(key, lockEntry{
 			token:   fmt.Sprintf("token-%d", i),
 			expires: now.Add(-time.Second),
 		})
 	}
-	l.storeEntry("live", lockEntry{token: "live", expires: now.Add(time.Hour)})
+	if got := l.trackedKeys(); got != maxTrackedLegacyKeys {
+		t.Fatalf("tracked key queues = %d, want cap %d", got, maxTrackedLegacyKeys)
+	}
+	if ok, err := l.Lock("overflow"); ok || !errors.Is(err, ErrLockTrackingLimit) {
+		t.Errorf("Lock beyond tracking capacity = (%v, %v), want (false, ErrLockTrackingLimit)", ok, err)
+	}
+	// An already tracked key remains usable at capacity.
+	if reserved, err := l.reserveKeyQueue("expired-0"); reserved || err != nil {
+		t.Errorf("existing-key reservation = (%v, %v), want (false, nil)", reserved, err)
+	}
+}
 
-	l.mu.Lock()
-	if got := len(l.lockStore); got != 1 {
-		l.mu.Unlock()
-		t.Fatalf("tracked key queues = %d, want only the live queue", got)
-	}
-	if _, ok := l.lockStore["live"]; !ok {
-		l.mu.Unlock()
-		t.Fatal("live queue was pruned")
-	}
-	l.mu.Unlock()
+// TestExpiredQueueSurvivesOtherKeysAndProtectsReacquisition verifies why an
+// expired distinct-key queue counts toward the global cap. Removing it when
+// another key arrives would let its stale Unlock consume this later live
+// acquisition and compare-and-delete the new holder's Redis token.
+func TestExpiredQueueSurvivesOtherKeysAndProtectsReacquisition(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+	l := NewRedisLocker(client)
 
-	l.storeEntry("protected", lockEntry{token: "old", expires: now.Add(-time.Second)})
-	l.storeEntry("protected", lockEntry{token: "new", expires: now.Add(time.Hour)})
-	l.storeEntry("trigger", lockEntry{token: "trigger", expires: now.Add(time.Hour)})
-	l.mu.Lock()
-	protected := l.lockStore["protected"]
-	entries := 0
-	if protected != nil {
-		entries = len(protected.entries)
+	if ok, err := l.Lock("reused"); err != nil || !ok {
+		t.Fatalf("first Lock = (%v, %v), want (true, nil)", ok, err)
 	}
+	past := time.Now().Add(-time.Second)
+	l.mu.Lock()
+	l.lockStore["reused"].entries[0].expires = past
 	l.mu.Unlock()
-	if entries != 2 {
-		t.Errorf("protected queue entries = %d, want expired prefix plus live acquisition", entries)
+	if err := client.Del(context.Background(), "reused").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := l.Lock("other"); err != nil || !ok {
+		t.Fatalf("other-key Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+	l.lockTime = time.Minute
+	if ok, err := l.Lock("reused"); err != nil || !ok {
+		t.Fatalf("reacquire = (%v, %v), want (true, nil)", ok, err)
+	}
+	if err := l.Unlock("reused"); !errors.Is(err, ErrLockExpired) {
+		t.Fatalf("stale Unlock = %v, want ErrLockExpired", err)
+	}
+	if got, err := client.Get(context.Background(), "reused").Result(); err != nil || got == "" {
+		t.Fatalf("live Redis token after stale Unlock = (%q, %v), want it retained", got, err)
+	}
+	if err := l.Unlock("reused"); err != nil {
+		t.Errorf("live Unlock = %v", err)
 	}
 }
 

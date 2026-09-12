@@ -686,8 +686,12 @@ func TestFallbackForgetsRedisCountsAfterTheirLeaseBound(t *testing.T) {
 	}
 	// Deterministically model that bound passing. Delete the mock Redis key as
 	// well, so the state agrees with the server-side lease having expired.
-	state.redisUntil = time.Now().Add(-time.Second)
+	past := time.Now().Add(-time.Second)
+	state.redisUntil = past
 	h.heldMu.Unlock()
+	h.redisLocker.mu.Lock()
+	h.redisLocker.lockStore["abandoned"].entries[0].expires = past
+	h.redisLocker.mu.Unlock()
 	if err := client.Del(context.Background(), "abandoned").Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -696,6 +700,14 @@ func TestFallbackForgetsRedisCountsAfterTheirLeaseBound(t *testing.T) {
 	defer mock.SetShouldFail(false)
 	if ok, err := h.Lock("abandoned"); err != nil || !ok {
 		t.Fatalf("Lock after Redis lease bound = (%v, %v), want local fallback", ok, err)
+	}
+	// The original Redis caller can still arrive late. Its Unlock consumes the
+	// retained Redis route and must not release the newer local acquisition.
+	if err := h.Unlock("abandoned"); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("stale Redis Unlock = %v, want ErrLockExpired", err)
+	}
+	if ok, err := h.localLocker.Lock("abandoned"); err != nil || ok {
+		t.Errorf("local lock after stale Redis Unlock = (%v, %v), want still held", ok, err)
 	}
 	if err := h.Unlock("abandoned"); err != nil {
 		t.Errorf("local fallback Unlock = %v", err)
@@ -956,6 +968,9 @@ func TestFallbackWaitsForEveryRedisAcquisition(t *testing.T) {
 	}
 	// Its lease elapses and the key is taken again by this same locker.
 	time.Sleep(60 * time.Millisecond)
+	// Give the second acquisition a long lease so scheduler or CI load cannot
+	// make it expire before the assertion below.
+	h.redisLocker.lockTime = time.Minute
 	if ok, err := h.Lock("k"); err != nil || !ok {
 		t.Fatalf("second Lock = (%v, %v), want (true, nil) after the lease elapsed", ok, err)
 	}

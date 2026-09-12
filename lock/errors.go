@@ -19,4 +19,9 @@ var (
 	// returns it rather than silently degrading to a process-local lock, which
 	// would drop mutual exclusion across instances at the moment it matters.
 	ErrRedisUnavailable = errors.New("redis unavailable")
+	// ErrLockTrackingLimit indicates that the legacy key-only API cannot safely
+	// remember another distinct key. Old routing records cannot be discarded:
+	// a late Unlock would otherwise be able to consume a later holder's token.
+	// Acquire returns a token-bearing Handle and has no such process-local cap.
+	ErrLockTrackingLimit = errors.New("legacy lock tracking limit reached")
 )
