@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/soulteary/redis-kit.svg)](https://pkg.go.dev/github.com/soulteary/redis-kit)
 [![Go Report Card](.github/goreportcard.svg)](.github/goreportcard-report.md)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/soulteary/redis-kit/graph/badge.svg)](https://codecov.io/gh/soulteary/redis-kit)
 
 [中文文档](README_CN.md)
@@ -90,6 +90,51 @@ success, err := hybridLocker.Lock("my-lock-key")
 - `HybridLocker` does **not** fall back to a local lock when Redis fails. A process-local lock provides no mutual exclusion between instances, so degrading to it during an outage drops the guarantee at exactly the moment it matters, and the caller cannot tell the difference from the return value. `NewHybridLocker` returns `lock.ErrRedisUnavailable` instead.
 - `NewHybridLockerWithLocalFallback` restores the degrading behaviour explicitly. Mutual exclusion across instances is lost while the fallback is in effect, so use it only where a second concurrent holder is acceptable. A key held through the fallback is not handed out via Redis again until it is released, and its unlock is routed back to the local lock.
 
+#### Handle API: a lock you can renew
+
+`Lock`/`Unlock` identify a lock by key alone, which is why `Unlock` has to check
+that this process still holds the lease. `Acquire` hands you the token instead, so
+`Release` and `Extend` act on **that specific acquisition**:
+
+```go
+locker := lock.NewRedisLocker(client)
+
+handle, err := locker.Acquire(ctx, "my-lock-key", 30*time.Second)
+if err != nil {
+    return err // includes "already held" — check errors.Is below
+}
+defer handle.Release(ctx)
+
+log.Printf("holding %s until %s", handle.Key(), handle.ExpiresAt())
+
+// Renew before the lease elapses, for work that outlives it
+if err := handle.Extend(ctx, 30*time.Second); err != nil {
+    return err // the lease is gone; stop doing the work it protected
+}
+```
+
+Without `Extend` the TTL is fixed at `lock.DefaultLockTime` (15s) and work that
+outlives the lease simply loses the lock, with no error anywhere.
+
+#### Lock errors
+
+| Sentinel | Meaning |
+|----------|---------|
+| `ErrRedisUnavailable` | Redis failed. `NewHybridLocker` returns this instead of degrading to a local lock — fail closed. |
+| `ErrLockExpired` | The lease elapsed before `Unlock`/`Release`. No delete was issued, so a later holder's lock is untouched. |
+| `ErrLockNotHeld` | This process holds no lock value for the key. |
+| `ErrLockValueMismatch` | The stored value is not this process's token. |
+| `ErrLockValueType` | The stored value is not the expected type. |
+| `ErrLockTrackingLimit` | The process-wide lock map is full. Prefer `Acquire`/`Handle`, which needs no map. |
+
+Match them with `errors.Is`.
+
+An `Unlock` whose lease has already elapsed reports `ErrLockExpired` **without
+issuing the delete**, so it cannot release a key a later holder has since
+acquired. Tracked entries are swept periodically, so a process that acquires and
+never releases — panic, early return, expiry — does not grow the map without
+bound.
+
 ### Rate Limiting
 
 ```go
@@ -125,6 +170,10 @@ allowed, remaining, resetTime, err := limiter.CheckDestinationLimit(ctx, "user@e
 **Notes**
 - Rate limiting and cooldown checks use Redis Lua scripts (`EVAL`) to ensure atomicity; make sure scripts are allowed in your Redis deployment.
 
+`CheckLimit` validates `limit`: a limit of `0` is rejected rather than treated
+as "no counter yet", which used to admit the first request of every window — so
+"allow nothing" let traffic through.
+
 ### Caching
 
 ```go
@@ -141,9 +190,14 @@ type User struct {
 user := User{ID: "123", Name: "Alice"}
 err := c.Set(ctx, "user:123", user, 1*time.Hour)
 
-// Get a value
+// Get a value. A miss is ErrKeyNotFound, which also matches redis.Nil.
 var retrievedUser User
-err := c.Get(ctx, "user:123", &retrievedUser)
+if err := c.Get(ctx, "user:123", &retrievedUser); err != nil {
+    if errors.Is(err, cache.ErrKeyNotFound) || errors.Is(err, redis.Nil) {
+        // not cached
+    }
+    return err
+}
 
 // Check existence
 exists, err := c.Exists(ctx, "user:123")
@@ -187,7 +241,7 @@ redis-kit/
 
 ## Requirements
 
-- Go 1.26 or later
+- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
 - Redis server (optional for testing, mock Redis is provided)
 
 ## Test Coverage
@@ -308,6 +362,43 @@ func main() {
 }
 ```
 
+## Upgrade Notes (v1.6.0)
+
+**`HybridLocker` no longer degrades to a local lock.** That is the change most
+likely to surface in a deployment, and it is deliberate.
+
+- **A Redis failure returns `ErrRedisUnavailable` instead of a local lock.**
+  `HybridLocker.Lock` tried Redis and fell through to `LocalLocker` on *any*
+  error. A process-local lock provides no exclusion between instances, so during
+  a Redis outage every instance took its own "lock" and believed it held the key
+  — and the caller saw `(true, nil)`, indistinguishable from a real distributed
+  lock. The guarantee disappeared at exactly the moment it mattered. **Handle
+  `ErrRedisUnavailable` and fail closed**, or use
+  `NewHybridLockerWithLocalFallback` to keep the old behaviour where a second
+  concurrent holder is genuinely acceptable — a cache warmer, never a payment.
+- **A stale holder can no longer release someone else's lock.** The token lived
+  in a process-wide map keyed by the lock key, so a second acquisition of the same
+  key overwrote the first holder's token and the first holder's `Unlock`
+  compare-and-deleted with the *second* holder's token. The map now records the
+  lease deadline too, and an `Unlock` past its lease reports `ErrLockExpired`
+  without issuing the delete. **An `Unlock` that used to succeed spuriously now
+  returns an error** — which is the correct answer.
+- **The lock map is swept and bounded.** A process that acquired and never
+  released grew it without bound; it now reports `ErrLockTrackingLimit` when full.
+- **`Acquire`/`Handle` is new**, and is the better API: it hands the token to the
+  caller, so `Release` and `Extend` act on a specific acquisition and need no
+  shared map. `Extend` also fills in the missing renewal path — the TTL was fixed
+  at 15s with no way to refresh it, so work outliving the lease lost the lock
+  silently.
+- **A cache miss carries `ErrKeyNotFound`, and matches `redis.Nil`.** `cache.Get`
+  returned a plain `fmt.Errorf`, so `errors.Is(err, redis.Nil)` was false and
+  callers had to match on the error text. The original message is preserved.
+- **`ratelimit.CheckLimit` validates `limit`.** With `limit=0` the Lua script took
+  its "no counter yet" branch and admitted the first request of every window, so
+  "allow nothing" let traffic through.
+- **The License badge said MIT.** The `LICENSE` file is Apache 2.0.
+- **Requirements said Go 1.26**; `go.mod` requires `1.27.0`.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -328,4 +419,4 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-See LICENSE file for details.
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
