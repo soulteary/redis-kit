@@ -5,11 +5,52 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/soulteary/redis-kit/testutil"
 )
+
+// delayExtendReplyHook pauses the caller after Redis has processed an Extend
+// but before Extend can publish its deadline and return. That opens the exact
+// window in which an unserialized Release could delete the key and return
+// success first.
+type delayExtendReplyHook struct {
+	processed chan struct{}
+	unblock   chan struct{}
+	once      sync.Once
+}
+
+func (h *delayExtendReplyHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+func (h *delayExtendReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		args := cmd.Args()
+		if len(args) > 1 && strings.EqualFold(fmt.Sprint(args[0]), "eval") &&
+			strings.Contains(fmt.Sprint(args[1]), "redis-kit:lock-extend") {
+			h.once.Do(func() {
+				close(h.processed)
+				<-h.unblock
+			})
+		}
+		return err
+	}
+}
+
+func (h *delayExtendReplyHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		return next(ctx, cmds)
+	}
+}
 
 func TestAcquireReleaseExtend(t *testing.T) {
 	client, _ := testutil.NewMockRedisClient()
@@ -215,6 +256,65 @@ func TestHandleErrorsPreserveCallerCancellation(t *testing.T) {
 	}
 	if err := h.Extend(ctx, time.Minute); !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRedisUnavailable) {
 		t.Errorf("Extend() error = %v, want both context.Canceled and ErrRedisUnavailable", err)
+	}
+}
+
+// TestReleaseWaitsForInFlightExtend is the regression test for Release racing
+// a heartbeat. Redis can execute the extension and deletion in that order
+// while their replies complete in the opposite order; Release then returned
+// success before Extend published a future deadline and also returned success
+// for a key that had already been deleted.
+func TestReleaseWaitsForInFlightExtend(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLocker(client)
+	h, err := l.Acquire(context.Background(), "release-extend", time.Minute)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+
+	hook := &delayExtendReplyHook{processed: make(chan struct{}), unblock: make(chan struct{})}
+	client.AddHook(hook)
+
+	extendDone := make(chan error, 1)
+	go func() { extendDone <- h.Extend(context.Background(), 2*time.Minute) }()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Extend did not reach the delayed-reply window")
+	}
+
+	releaseDone := make(chan error, 1)
+	go func() { releaseDone <- h.Release(context.Background()) }()
+
+	var releaseErr error
+	releasedEarly := false
+	select {
+	case releaseErr = <-releaseDone:
+		releasedEarly = true
+	case <-time.After(100 * time.Millisecond):
+		// Release is correctly waiting for the complete Extend operation.
+	}
+
+	close(hook.unblock)
+	if err := <-extendDone; err != nil {
+		t.Errorf("Extend() error = %v", err)
+	}
+	if !releasedEarly {
+		releaseErr = <-releaseDone
+	}
+	if releasedEarly {
+		t.Fatalf("Release() returned %v while Extend was still publishing its lease", releaseErr)
+	}
+	if releaseErr != nil {
+		t.Fatalf("Release() error = %v", releaseErr)
+	}
+
+	if err := h.Extend(context.Background(), time.Minute); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("Extend() after Release = %v, want ErrLockExpired", err)
 	}
 }
 

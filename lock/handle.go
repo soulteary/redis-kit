@@ -49,16 +49,20 @@ type Handle struct {
 	mu      sync.RWMutex
 	expires time.Time
 
-	// extendMu serialises an Extend's Eval with the deadline that Eval
-	// publishes. mu alone only ordered the assignments: two goroutines
-	// extending the same handle issue their PEXPIREs on separate pooled
+	// leaseMu serialises operations that change ownership of this lease. It
+	// keeps an Extend's Eval and deadline publication indivisible relative to
+	// both another Extend and Release. mu alone only orders the assignments.
+	// Two goroutines extending the same handle issue their PEXPIREs on separate pooled
 	// connections, whose replies can arrive in a different order from the
 	// order Redis ran them, so an older long extension could publish its
 	// deadline after a newer short one had become the server's actual TTL --
 	// and ExpiresAt then promised ownership the lease no longer had.
+	// Likewise, Release must not delete the key while an Extend is waiting for
+	// its reply and then let that Extend publish a future deadline and report
+	// success after the lock has gone.
 	//
 	// It is deliberately not mu: ExpiresAt must not wait on a network call.
-	extendMu sync.Mutex
+	leaseMu sync.Mutex
 }
 
 // Key returns the locked key.
@@ -128,6 +132,9 @@ func (h *Handle) Release(ctx context.Context) error {
 		return ErrLockNotHeld
 	}
 
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+
 	res, err := h.client.Eval(ctx, releaseScript, []string{h.key}, h.token).Result()
 	if err != nil {
 		return fmt.Errorf("%w: release %q: %w", ErrRedisUnavailable, h.key, err)
@@ -166,8 +173,8 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// rounded value.
 	ttl = roundUpMillis(ttl)
 
-	h.extendMu.Lock()
-	defer h.extendMu.Unlock()
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
 
 	// Same pre-command stamp as Acquire: Redis restarts the TTL when it runs
 	// PEXPIRE, so measuring from the reply overstates the new lease.
