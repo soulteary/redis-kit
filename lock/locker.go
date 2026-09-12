@@ -113,7 +113,7 @@ func generateLockValue() (string, error) {
 // Returns true if the lock was successfully acquired, false if the lock is already held
 func (r *RedisLocker) Lock(key string) (bool, error) {
 	if r.client == nil {
-		return false, fmt.Errorf("%w: redis client is nil", ErrRedisUnavailable)
+		return false, fmt.Errorf("redis client is nil")
 	}
 	if r.lockTime <= 0 {
 		return false, fmt.Errorf("lock time must be positive, got %s", r.lockTime)
