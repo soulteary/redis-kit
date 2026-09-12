@@ -22,10 +22,78 @@ const (
 
 // RedisLocker provides Redis-based distributed lock functionality
 type RedisLocker struct {
-	client    *redis.Client
-	lockTime  time.Duration
-	lockStore sync.Map // Stores key -> lockValue mapping
+	client   *redis.Client
+	lockTime time.Duration
+
+	// mu guards lockStore.
+	mu sync.Mutex
+
+	// operationMu serialises each legacy Lock/Unlock operation per key. Lock
+	// keeps SET and enqueue in Redis execution order; Unlock keeps dequeue,
+	// Eval and a possible restore indivisible so concurrent transport failures
+	// cannot restore entries in reply-completion order and reorder the queue.
+	operationMu keyedMutex
+
+	// lockStore maps key -> the outstanding acquisitions for that key, for the
+	// legacy Lock/Unlock pair -- which identifies a lock by key alone and so
+	// has nowhere else to keep the token.
+	//
+	// A queue rather than a single entry, because the same locker can acquire
+	// a key again after its lease elapses: storing only the latest let the
+	// FIRST holder's Unlock consume the SECOND holder's token and
+	// compare-and-delete a lock it never held. Unlock takes the oldest
+	// outstanding entry, so each caller gets back its own acquisition and a
+	// late Unlock finds its own expired one.
+	//
+	// Prefer Acquire, which hands the token to the caller in a Handle and does
+	// not use this map at all.
+	lockStore map[string]*keyQueue
 }
+
+// keyQueue is the outstanding acquisitions for one key, oldest first.
+type keyQueue struct {
+	entries []lockEntry
+
+	// tombstones counts acquisitions dropped by the cap.
+	//
+	// Their callers can still call Unlock, and simply discarding the entries
+	// would shift every later caller onto somebody else's acquisition -- after
+	// enough late unlocks a stale caller would reach the newest, still-live
+	// token and compare-and-delete the current holder's lock. Each tombstone
+	// absorbs exactly one Unlock, reporting ErrLockExpired, so the
+	// caller-to-acquisition correspondence survives capping.
+	tombstones int
+}
+
+// lockEntry is one legacy acquisition: its token and when its lease elapses.
+//
+// Recording the expiry is what makes the legacy pair safe. Previously only the
+// token was stored, keyed by lock key, so a second acquisition of the same key
+// overwrote the first one's token -- and the first holder's Unlock then
+// compare-and-deleted using the *second* holder's token, releasing a lock it
+// never held. Redis's compare-and-delete was correct; the process-local cache
+// in front of it was not.
+type lockEntry struct {
+	token   string
+	expires time.Time
+}
+
+// maxOutstandingPerKey bounds the queue for one key.
+//
+// A balanced Lock/Unlock pair leaves an empty queue and the key is dropped, so
+// this only matters for a process that acquires and never releases (a panic,
+// an early return). Past the cap the oldest entry is discarded to bound
+// memory; tombstones preserve Unlock ordering while a later live entry still
+// needs protection.
+const maxOutstandingPerKey = 1024
+
+// maxTrackedLegacyKeys bounds the number of distinct keys retained by the
+// legacy key-only API. An expired acquisition still has to occupy its FIFO
+// position: deleting it would let its late Unlock consume a later holder's
+// token after the key is reacquired. New distinct keys are therefore rejected
+// at this limit instead of sacrificing routing safety. Acquire stores its
+// token in the returned Handle and does not use this map.
+const maxTrackedLegacyKeys = 1024
 
 // NewRedisLocker creates a new Redis-based distributed locker
 func NewRedisLocker(client *redis.Client) *RedisLocker {
@@ -35,8 +103,9 @@ func NewRedisLocker(client *redis.Client) *RedisLocker {
 // NewRedisLockerWithLockTime creates a new Redis-based distributed locker with custom lock time
 func NewRedisLockerWithLockTime(client *redis.Client, lockTime time.Duration) *RedisLocker {
 	return &RedisLocker{
-		client:   client,
-		lockTime: lockTime,
+		client:    client,
+		lockTime:  lockTime,
+		lockStore: make(map[string]*keyQueue),
 	}
 }
 
@@ -55,6 +124,9 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	if r.client == nil {
 		return false, fmt.Errorf("redis client is nil")
 	}
+	if r.lockTime <= 0 {
+		return false, fmt.Errorf("lock time must be positive, got %s", r.lockTime)
+	}
 
 	lockValue, err := generateLockValue()
 	if err != nil {
@@ -64,36 +136,154 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
 	defer cancel()
 
-	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
+	// The SET and the enqueue below are one operation per key. Apart, the
+	// queue is ordered by REPLY COMPLETION rather than by Redis execution: A's
+	// SET can succeed and have its reply delayed past the lease, B can then
+	// acquire and reply first, and the queue records B before A. A's Unlock --
+	// which takes the OLDEST entry -- would then pop B's live token and delete
+	// a lock B is still holding.
+	release := r.operationMu.lock(key)
+	defer release()
+
+	reserved, err := r.reserveKeyQueue(key)
+	if err != nil {
+		return false, err
+	}
+
+	issued := time.Now()
+	ttl := roundUpMillis(r.lockTime)
+	deadline := issued.Add(ttl)
+	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: ttl}).Result()
 	if err != nil && err != redis.Nil {
-		return false, fmt.Errorf("failed to acquire lock: %w", err)
+		if reserved {
+			r.dropEmptyQueue(key)
+		}
+		return false, fmt.Errorf("%w: failed to acquire lock: %w", ErrRedisUnavailable, err)
 	}
 	res := (err == nil)
 	if res {
-		// Store lockValue for subsequent unlock verification
-		r.lockStore.Store(key, lockValue)
+		// As with Handle.Acquire, a reply received after the conservative
+		// deadline must not let the caller begin work as a holder.
+		if !time.Now().Before(deadline) {
+			if reserved {
+				r.dropEmptyQueue(key)
+			}
+			return false, rejectLateLease(ctx, r.client, key, lockValue, ttl)
+		}
+		// Append rather than replace: a previous holder of this key may not
+		// have unlocked yet, and its Unlock must find ITS entry, not this one.
+		r.storeEntry(key, lockEntry{token: lockValue, expires: deadline})
+	} else if reserved {
+		r.dropEmptyQueue(key)
 	}
 
 	return res, nil
 }
 
-// Unlock releases a distributed lock using a Lua script to ensure atomicity
-// Only releases the lock if the lock value matches, preventing accidental release of another process's lock
+// takeOldest removes and returns the oldest outstanding acquisition for key.
+func (r *RedisLocker) takeOldest(key string) (lockEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	q := r.lockStore[key]
+	if q == nil {
+		return lockEntry{}, false
+	}
+
+	var entry lockEntry
+	switch {
+	case q.tombstones > 0:
+		// A capped acquisition: absorb this Unlock without touching Redis.
+		// entry's zero expiry is already in the past, so the caller gets
+		// ErrLockExpired.
+		q.tombstones--
+	case len(q.entries) > 0:
+		entry = q.entries[0]
+		q.entries = q.entries[1:]
+	default:
+		delete(r.lockStore, key)
+		return lockEntry{}, false
+	}
+
+	// Keep an empty queue reserved until Redis gives Unlock a definitive
+	// answer. On a transport failure restoreOldest must be able to put this
+	// exact acquisition back without racing another distinct key for capacity.
+	return entry, true
+}
+
+// reserveKeyQueue reserves bounded routing state before Redis is allowed to
+// grant a legacy acquisition. It returns whether this call created the queue.
+func (r *RedisLocker) reserveKeyQueue(key string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lockStore == nil {
+		r.lockStore = make(map[string]*keyQueue)
+	}
+	if _, ok := r.lockStore[key]; ok {
+		return false, nil
+	}
+	if len(r.lockStore) >= maxTrackedLegacyKeys {
+		return false, fmt.Errorf("%w (%d keys); use Acquire", ErrLockTrackingLimit, maxTrackedLegacyKeys)
+	}
+	r.lockStore[key] = &keyQueue{}
+	return true, nil
+}
+
+// dropEmptyQueue releases a reservation after a failed acquisition or a
+// definitive Unlock. A non-empty queue belongs to another outstanding
+// acquisition and is never discarded here.
+func (r *RedisLocker) dropEmptyQueue(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if q := r.lockStore[key]; q != nil && q.tombstones == 0 && len(q.entries) == 0 {
+		delete(r.lockStore, key)
+	}
+}
+
+// Unlock releases a distributed lock using a Lua script to ensure atomicity.
+// Only releases the lock if the lock value matches, preventing accidental
+// release of another process's lock.
+//
+// It consumes the OLDEST outstanding acquisition of key -- and only on a
+// DEFINITIVE result -- which is this caller's own in the paired usage this API
+// assumes. The key alone cannot
+// identify the caller, so when two holders of one key finish out of order --
+// the second one's lease outliving the first's -- the second's Unlock takes
+// the first's expired entry, reports ErrLockExpired, and leaves its own lock
+// in place until the TTL elapses. That is the safe half of the trade: letting
+// an Unlock skip an expired entry to find a live one is exactly how a late
+// caller comes to delete a current holder's lock. Acquire returns a Handle
+// carrying its own token and has neither problem.
 func (r *RedisLocker) Unlock(key string) error {
 	if r.client == nil {
 		return fmt.Errorf("redis client is nil")
 	}
 
-	// Get stored lockValue
-	value, ok := r.lockStore.LoadAndDelete(key)
+	// Dequeue, Redis verdict and a possible restore are one operation per key.
+	// Without this, two failed Unlock calls can restore their entries in the
+	// opposite order: whichever Redis error returns last is prepended last.
+	// A later retry can then consume the newer live token and release a lock it
+	// did not acquire. The same mutex is used by Lock, so an acquisition cannot
+	// be inserted into the queue halfway through this transaction either.
+	release := r.operationMu.lock(key)
+	defer release()
+
+	// Take the OLDEST outstanding acquisition for this key, which is this
+	// caller's own in the paired usage the legacy API assumes.
+	entry, ok := r.takeOldest(key)
 	if !ok {
 		return ErrLockNotHeld
 	}
 
-	lockValue, ok := value.(string)
-	if !ok {
-		return ErrLockValueType
+	// If our lease already elapsed, the key in Redis is either gone or held by
+	// somebody who acquired it after us. Reporting that without touching Redis
+	// is what stops a late Unlock from deleting another holder's lock.
+	if !time.Now().Before(entry.expires) {
+		r.dropEmptyQueue(key)
+		return ErrLockExpired
 	}
+
+	lockValue := entry.token
 
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultOperationTimeout)
 	defer cancel()
@@ -108,26 +298,204 @@ func (r *RedisLocker) Unlock(key string) error {
 	`
 	result, err := r.client.Eval(ctx, script, []string{key}, lockValue).Result()
 	if err != nil {
-		return fmt.Errorf("failed to release lock: %w", err)
+		// The entry goes BACK, at the front. ErrRedisUnavailable is not a
+		// verdict about the lock, so consuming the acquisition on one would
+		// point a retried Unlock at the NEXT entry: once this lease expired
+		// and the same locker acquired the key again, that retry would
+		// compare-and-delete the new, live lock. An acquisition is consumed
+		// only by a definitive result.
+		r.restoreOldest(key, entry)
+
+		// Classified, not just wrapped. A transport failure is NOT a verdict
+		// about the lock -- the lease may still be held -- and callers have to
+		// be able to tell it apart from ErrLockExpired or a value mismatch.
+		// HybridLocker's own guard tested for ErrRedisUnavailable here and
+		// never saw it, so it treated every outage as definitive and dropped
+		// the record that stops a local fallback being granted for a key
+		// Redis may still hold.
+		return fmt.Errorf("%w: failed to release lock: %w", ErrRedisUnavailable, err)
 	}
 
 	// Check if lock was actually released
 	if val, ok := result.(int64); !ok || val == 0 {
+		r.dropEmptyQueue(key)
 		return ErrLockValueMismatch
 	}
 
+	r.dropEmptyQueue(key)
 	return nil
 }
 
-// HybridLocker provides distributed lock functionality with automatic fallback to local lock
-// If Redis is unavailable or operations fail, it automatically falls back to local lock
+// HybridLocker locks through Redis when a client is configured, and through a
+// process-local lock when one is not.
+//
+// It does NOT fall back to the local lock when Redis is merely failing, unless
+// allowLocalFallback is set. A process-local lock provides no mutual exclusion
+// between instances, so degrading to it during a Redis outage silently drops
+// the guarantee at exactly the moment it matters -- and the caller sees
+// (true, nil), indistinguishable from a real distributed lock. Use
+// NewHybridLockerWithLocalFallback to opt back in where losing exclusion is
+// genuinely acceptable (a cache warmer, say, but never a payment or a coupon).
 type HybridLocker struct {
-	redisLocker *RedisLocker
-	localLocker *LocalLocker
+	redisLocker        *RedisLocker
+	localLocker        *LocalLocker
+	allowLocalFallback bool
+
+	// fallbackMu serialises the complete backend-routing decision per key, so
+	// one key cannot be acquired through both backends while unrelated keys
+	// continue independently during a slow Redis outage.
+	fallbackMu keyedMutex
+	// heldMu protects held; it is held only for short map operations, never a
+	// Redis request.
+	heldMu sync.Mutex
+	// held counts this locker's outstanding acquisitions per key, by backend.
+	//
+	// A COUNT, not a single marker: the legacy queue lets one locker hold the
+	// same key more than once -- reacquiring after a lease elapses -- and a
+	// key-level marker was cleared by the first definitive unlock. The newer
+	// Redis lock was still live, so a local fallback could then be granted
+	// alongside it.
+	held map[string]*backendCounts
 }
 
-// NewHybridLocker creates a new hybrid locker that supports both Redis and local locking
-// If client is nil, it will only use local locking
+// backendCounts is how many acquisitions of one key are outstanding on each
+// backend, the conservative expiry bound for normal Redis acquisitions, and
+// the bound for a late Redis acquisition whose cleanup failed. At most one
+// live backend count is non-zero: Lock refuses to mix them while either can
+// live. Expired Redis routes may coexist with a later live backend solely to
+// absorb stale FIFO Unlock calls.
+type backendCounts struct {
+	redis          int
+	redisExpired   int
+	local          int
+	redisUntil     time.Time
+	uncertainUntil time.Time
+}
+
+// fallbackActive reports whether this locker can hold a key through the local
+// lock while also talking to Redis -- the only configuration in which an
+// unlock has two possible destinations.
+func (h *HybridLocker) fallbackActive() bool {
+	return h.redisLocker != nil && h.allowLocalFallback
+}
+
+// counts returns key's outstanding acquisitions.
+func (h *HybridLocker) counts(key string) backendCounts {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	if c := h.held[key]; c != nil {
+		now := time.Now()
+		// A Redis count protects against local fallback only while at least one
+		// corresponding server lease can still exist. redisUntil is a
+		// conservative upper bound taken from the successful reply plus the full
+		// rounded TTL.
+		if c.redis > 0 && !c.redisUntil.IsZero() && !now.Before(c.redisUntil) {
+			// Preserve one FIFO routing tombstone per elapsed Redis acquisition.
+			// They no longer block fallback, but their late Unlock calls must be
+			// absorbed before a later local holder can be released.
+			c.redisExpired += c.redis
+			c.redis = 0
+			c.redisUntil = time.Time{}
+		}
+		if !c.uncertainUntil.IsZero() && !now.Before(c.uncertainUntil) {
+			c.uncertainUntil = time.Time{}
+		}
+		if c.redis <= 0 && c.redisExpired <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
+			delete(h.held, key)
+			return backendCounts{}
+		}
+		return *c
+	}
+	return backendCounts{}
+}
+
+// acquired records one more acquisition.
+func (h *HybridLocker) acquired(key string, redisBacked bool, redisUntil time.Time) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	if h.held == nil {
+		h.held = make(map[string]*backendCounts)
+	}
+	c := h.held[key]
+	if c == nil {
+		c = &backendCounts{}
+		h.held[key] = c
+	}
+	if redisBacked {
+		c.redis++
+		if redisUntil.After(c.redisUntil) {
+			c.redisUntil = redisUntil
+		}
+	} else {
+		c.local++
+	}
+}
+
+// released records one fewer acquisition.
+func (h *HybridLocker) released(key string, redisBacked bool) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	c := h.held[key]
+	if c == nil {
+		return
+	}
+	if redisBacked {
+		if c.redis > 0 {
+			c.redis--
+		}
+		if c.redis == 0 {
+			c.redisUntil = time.Time{}
+		}
+	} else {
+		if c.local > 0 {
+			c.local--
+		}
+	}
+	if c.redis <= 0 && c.redisExpired <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
+		delete(h.held, key)
+	}
+}
+
+// releaseExpiredRedis consumes one elapsed Redis route after its matching
+// legacy queue entry has been discarded locally.
+func (h *HybridLocker) releaseExpiredRedis(key string) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	c := h.held[key]
+	if c == nil {
+		return
+	}
+	if c.redisExpired > 0 {
+		c.redisExpired--
+	}
+	if c.redis <= 0 && c.redisExpired <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
+		delete(h.held, key)
+	}
+}
+
+// markUncertain prevents a local fallback while a late successful Redis SET
+// may still exist and its compare-and-delete cleanup had no verdict.
+func (h *HybridLocker) markUncertain(key string, until time.Time) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	if h.held == nil {
+		h.held = make(map[string]*backendCounts)
+	}
+	c := h.held[key]
+	if c == nil {
+		c = &backendCounts{}
+		h.held[key] = c
+	}
+	if until.After(c.uncertainUntil) {
+		c.uncertainUntil = until
+	}
+}
+
+// NewHybridLocker creates a hybrid locker that uses Redis when client is
+// non-nil and a process-local lock when it is nil.
+//
+// If a Redis operation fails, the error is returned rather than silently
+// degrading to the local lock.
 func NewHybridLocker(client *redis.Client) *HybridLocker {
 	hl := &HybridLocker{
 		localLocker: NewLocalLocker(),
@@ -140,44 +508,285 @@ func NewHybridLocker(client *redis.Client) *HybridLocker {
 	return hl
 }
 
-// Lock acquires a lock, trying Redis first and falling back to local lock if Redis fails
+// NewHybridLockerWithLocalFallback is NewHybridLocker with the pre-existing
+// behaviour of falling back to a process-local lock when Redis fails.
+//
+// Mutual exclusion across instances is lost while the fallback is in effect.
+// Only use it where a concurrent second holder is acceptable.
+func NewHybridLockerWithLocalFallback(client *redis.Client) *HybridLocker {
+	hl := NewHybridLocker(client)
+	hl.allowLocalFallback = true
+	return hl
+}
+
+// Lock acquires a lock through Redis when configured.
+//
+// On a Redis failure it returns the error, so the caller can fail closed.
+// Only a locker built with NewHybridLockerWithLocalFallback degrades to the
+// process-local lock instead.
 func (h *HybridLocker) Lock(key string) (bool, error) {
-	// Try Redis first if available
+	if h.fallbackActive() {
+		// Held for this key's whole decision, Redis call included. A key already
+		// held through the local fallback must not be handed out again via
+		// Redis the moment Redis recovers: that puts two holders in the
+		// critical section, and the local holder's Unlock then goes on to
+		// consume the Redis holder's token. Unrelated keys use independent
+		// entries and do not queue behind this network call.
+		releaseDecision := h.fallbackMu.lock(key)
+		defer releaseDecision()
+
+		switch c := h.counts(key); {
+		case c.local > 0:
+			// A local fallback is outstanding. Do not hand the key out
+			// through Redis: that is a second holder in the same critical
+			// section. The local locker refuses it, which is the answer.
+			return h.localLocker.Lock(key)
+
+		case c.redis > 0:
+			// A Redis acquisition is outstanding. Never degrade to the local
+			// lock for THIS key, even now that Redis is unreachable -- that
+			// holder is still running. Refusing costs availability for one
+			// key; degrading would put two callers inside it.
+			success, err := h.redisLocker.Lock(key)
+			if err == nil {
+				if success {
+					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
+				}
+				return success, nil
+			}
+			var uncertain *uncertainLeaseError
+			if errors.As(err, &uncertain) {
+				h.markUncertain(key, uncertain.until)
+			}
+			return false, err
+
+		case !c.uncertainUntil.IsZero():
+			return false, fmt.Errorf("%w: Redis ownership of %q remains uncertain until %s", ErrRedisUnavailable, key, c.uncertainUntil)
+
+		default:
+			success, err := h.redisLocker.Lock(key)
+			if err == nil {
+				if success {
+					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
+				}
+				return success, nil
+			}
+			// Only an unavailable Redis activates the explicit fallback. A
+			// definitive error such as an acquisition reply arriving after its
+			// lease deadline must be reported, not converted into a local grant.
+			// Test expiration first: failed cleanup of a late lease deliberately
+			// matches BOTH sentinels, and its uncertain Redis lock makes local
+			// fallback especially unsafe.
+			if errors.Is(err, ErrLockExpired) {
+				var uncertain *uncertainLeaseError
+				if errors.As(err, &uncertain) {
+					h.markUncertain(key, uncertain.until)
+				}
+				return false, err
+			}
+			if !errors.Is(err, ErrRedisUnavailable) {
+				return false, err
+			}
+			if c.redisExpired > 0 {
+				// Unlock identifies only a key, not its caller. If a local holder
+				// were admitted while an older Redis route remained, either
+				// caller's single Unlock could be mistaken for the other. Fail
+				// closed until the expired route is consumed; token-bearing Handle
+				// acquisitions do not have this ambiguity.
+				return false, fmt.Errorf("%w: %d expired Redis acquisition(s) for %q still await Unlock", ErrLockExpired, c.redisExpired, key)
+			}
+			// Explicitly opted in: mutual exclusion across instances is now lost.
+			success, err = h.localLocker.Lock(key)
+			if success && err == nil {
+				h.acquired(key, false, time.Time{})
+			}
+			return success, err
+		}
+	}
+
 	if h.redisLocker != nil {
 		success, err := h.redisLocker.Lock(key)
 		if err == nil {
 			return success, nil
 		}
-		// If Redis fails, fall back to local lock
+		return false, err
 	}
 
-	// Fall back to local lock
 	return h.localLocker.Lock(key)
 }
 
-// Unlock releases a lock, trying Redis first and falling back to local lock if Redis fails
+// Unlock releases a lock through the backend that acquired it.
+//
+// The routing is recorded, not guessed. Trying Redis first and falling back to
+// the local lock on error was a lock-stealing path in both directions: a
+// locally-acquired key was released by deleting whatever Redis held for it --
+// another goroutine's token, once Redis recovered -- and a Redis-acquired key
+// whose release failed went on to release whatever was held locally.
 func (h *HybridLocker) Unlock(key string) error {
-	// Try Redis first if available
-	if h.redisLocker != nil {
-		// Check if this key was locked via Redis by checking if it exists in lockStore
-		// We can't directly check, so we try Redis unlock first
-		err := h.redisLocker.Unlock(key)
-		if err == nil {
-			return nil
-		}
-		// If Redis unlock fails due to lock value mismatch or lock expired,
-		// we should return the error instead of falling back to local lock
-		// Only fall back to local lock for connection/network errors
-		if errors.Is(err, ErrLockValueMismatch) || errors.Is(err, ErrLockValueType) {
+	if h.fallbackActive() {
+		releaseDecision := h.fallbackMu.lock(key)
+		defer releaseDecision()
+
+		switch c := h.counts(key); {
+		case c.redisExpired > 0:
+			// This is the FIFO position of a Redis acquisition whose lease can
+			// no longer exist. Consume its underlying queue entry without a Redis
+			// command, and do not let this stale Unlock reach a later local lock.
+			if h.redisLocker.consumeExpiredOldest(key) {
+				h.releaseExpiredRedis(key)
+			}
+			return ErrLockExpired
+
+		case c.local > 0:
+			h.released(key, false)
+			return h.localLocker.Unlock(key)
+
+		case c.redis > 0:
+			err := h.redisLocker.Unlock(key)
+			// Drop ONE acquisition once the answer is definitive -- released,
+			// or no longer ours. An unreachable Redis is not definitive: the
+			// lease may still be held there, so the count stays and no local
+			// fallback is granted for the key. RedisLocker.Unlock classifies
+			// transport failures as ErrRedisUnavailable, which is what makes
+			// this test mean anything.
+			if err == nil || !errors.Is(err, ErrRedisUnavailable) {
+				h.released(key, true)
+			}
 			return err
+
+		default:
+			// Nothing recorded: this locker never took the key. Ask Redis,
+			// which will say so, and never reach for the local lock -- that
+			// would release a lock this caller never held.
+			return h.redisLocker.Unlock(key)
 		}
-		// For other errors (e.g., connection failures), try local unlock
-		if localErr := h.localLocker.Unlock(key); localErr == nil {
-			return nil
-		}
-		return err
 	}
 
-	// Fall back to local lock
+	if h.redisLocker != nil {
+		return h.redisLocker.Unlock(key)
+	}
+
 	return h.localLocker.Unlock(key)
+}
+
+// storeEntry records an acquisition for key, oldest first.
+//
+// Only Lock and the package's own tests use it; callers identify a lock by
+// key alone through the legacy API and have nothing to pass here.
+// restoreOldest puts an acquisition back at the front of key's queue after an
+// Unlock that got no verdict, so the retry consumes the same one.
+func (r *RedisLocker) restoreOldest(key string, entry lockEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	q := r.lockStore[key]
+	if q == nil {
+		q = &keyQueue{}
+		r.lockStore[key] = q
+	}
+
+	// At the FRONT: it is still the oldest outstanding acquisition, and any
+	// entry appended while Redis was being asked is newer than it.
+	q.entries = append([]lockEntry{entry}, q.entries...)
+	if over := len(q.entries) - maxOutstandingPerKey; over > 0 {
+		q.entries = q.entries[over:]
+		q.tombstones += over
+	}
+}
+
+func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	q := r.lockStore[key]
+	if q == nil {
+		q = &keyQueue{}
+		r.lockStore[key] = q
+	}
+
+	q.entries = append(q.entries, entry)
+	if over := len(q.entries) - maxOutstandingPerKey; over > 0 {
+		// Leave a tombstone per dropped entry rather than silently shifting
+		// later callers onto somebody else's acquisition.
+		q.entries = q.entries[over:]
+		q.tombstones += over
+	}
+}
+
+// consumeExpiredOldest discards one elapsed acquisition without talking to
+// Redis. HybridLocker uses it when an expired backend route precedes a later
+// local acquisition. It defensively restores a still-live entry and reports
+// false, although HybridLocker's conservative bound should make that case
+// unreachable. The per-key operation mutex preserves the legacy FIFO.
+func (r *RedisLocker) consumeExpiredOldest(key string) bool {
+	release := r.operationMu.lock(key)
+	defer release()
+	entry, ok := r.takeOldest(key)
+	if !ok {
+		// Tests and callers can replace a HybridLocker's backend; no entry in
+		// this backend means there is nothing here that a later Unlock can hit.
+		return true
+	}
+	if time.Now().Before(entry.expires) {
+		r.restoreOldest(key, entry)
+		return false
+	}
+	r.dropEmptyQueue(key)
+	return true
+}
+
+// outstanding reports how many acquisitions are recorded for key.
+func (r *RedisLocker) outstanding(key string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if q := r.lockStore[key]; q != nil {
+		return len(q.entries) + q.tombstones
+	}
+	return 0
+}
+
+// trackedKeys reports how many keys have outstanding acquisitions recorded.
+func (r *RedisLocker) trackedKeys() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.lockStore)
+}
+
+// keyedMutex serialises operations per key without serialising across keys.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*keyedEntry
+}
+
+type keyedEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock blocks until key is free and returns the function that releases it.
+// The per-key entry is dropped once nobody is waiting on it, so the map does
+// not grow with the key space.
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = make(map[string]*keyedEntry)
+	}
+	e := k.m[key]
+	if e == nil {
+		e = &keyedEntry{}
+		k.m[key] = e
+	}
+	e.refs++
+	k.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		k.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(k.m, key)
+		}
+		k.mu.Unlock()
+	}
 }

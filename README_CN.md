@@ -12,7 +12,7 @@
 ## 功能特性
 
 - **客户端管理** - 统一的 Redis 客户端初始化和配置
-- **分布式锁** - 基于 Redis 的分布式锁，支持自动降级到本地锁
+- **分布式锁** - 基于 Redis 的分布式锁，可选地降级到本地锁
 - **限流器** - 灵活的限流功能，支持用户/IP/目标地址的限流
 - **缓存** - 通用缓存接口，提供 Redis 实现
 - **健康检查** - 内置健康检查功能
@@ -73,14 +73,21 @@ if !success {
 // 释放锁
 defer locker.Unlock("my-lock-key")
 
-// 或使用混合锁（自动降级到本地锁）
+// 或使用混合锁。client 非 nil 时走 Redis，为 nil 时使用进程内本地锁。
+// 当 Redis 只是「出故障」时会返回 lock.ErrRedisUnavailable 而不是悄悄降级，
+// 以便调用方可以 fail closed：
 hybridLocker := lock.NewHybridLocker(client)
+
+// 仅在「允许出现第二个并发持有者」的场景（例如缓存预热，绝不能用于支付）
+// 才显式选择旧的降级行为：
+hybridLocker = lock.NewHybridLockerWithLocalFallback(client)
 success, err := hybridLocker.Lock("my-lock-key")
 ```
 
 **注意事项**
 - `Unlock` 需要同一进程持有锁值；当本地没有锁值时会返回错误，以避免误删他人持有的锁。
-- `HybridLocker` 仅在 Redis 操作失败时才回退到本地锁，多实例部署请谨慎使用本地回退以避免“脑裂”。
+- `HybridLocker` 在 Redis 失败时**不会**回退到本地锁。本地锁不提供跨实例互斥，在 Redis 故障期间降级恰恰是在最需要锁的时刻丢掉保证，而调用方从返回值上根本分辨不出来。`NewHybridLocker` 会返回 `lock.ErrRedisUnavailable`。
+- 需要旧的降级行为时请显式使用 `NewHybridLockerWithLocalFallback`。降级生效期间跨实例互斥会丢失，只适用于允许出现第二个并发持有者的场景。通过回退持有的 key 在释放前不会再经 Redis 发放，其 unlock 也会被路由回本地锁。
 
 ### 限流器
 

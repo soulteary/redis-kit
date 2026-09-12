@@ -88,6 +88,12 @@ func (r *RateLimiter) CheckLimit(ctx context.Context, key string, limit int, win
 	if windowMs <= 0 {
 		return false, 0, time.Time{}, fmt.Errorf("window must be positive")
 	}
+	// A non-positive limit means "allow nothing". Without this check the Lua
+	// script takes its "no counter yet" branch and lets the first request of
+	// every window through, so limit=0 admitted traffic instead of blocking it.
+	if limit <= 0 {
+		return false, 0, time.Now().Add(window), nil
+	}
 
 	redisKey := r.keyPrefix + key
 

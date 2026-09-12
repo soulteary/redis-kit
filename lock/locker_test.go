@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -193,7 +194,7 @@ func TestRedisLocker_Unlock(t *testing.T) {
 
 		// Manually set a different lock value in locker2's lockStore to simulate mismatch
 		// Then try to unlock - should fail because lock value doesn't match
-		locker2.lockStore.Store(key, "wrong-value")
+		locker2.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 
 		// Try to unlock with locker2 (different lock value)
 		err := locker2.Unlock(key)
@@ -252,8 +253,10 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		if err == nil {
 			t.Log("Unlock() on expired lock succeeded (lock may have been auto-expired)")
 		}
-		if err != nil && !errors.Is(err, ErrLockValueMismatch) && !errors.Is(err, ErrLockNotHeld) {
-			t.Errorf("Unlock() on expired lock error = %v, want mismatch or not held", err)
+		// An elapsed lease is reported as ErrLockExpired and, crucially, without
+		// issuing the delete: the key may already belong to a later holder.
+		if err != nil && !errors.Is(err, ErrLockExpired) && !errors.Is(err, ErrLockValueMismatch) && !errors.Is(err, ErrLockNotHeld) {
+			t.Errorf("Unlock() on expired lock error = %v, want expired, mismatch or not held", err)
 		}
 	})
 
@@ -287,18 +290,13 @@ func TestRedisLocker_Unlock(t *testing.T) {
 		locker := NewRedisLocker(client)
 		key := "test-lock"
 
-		// Lock first to have key in Redis
+		// lockStore is now a typed []lockEntry, so a wrongly-typed entry
+		// cannot be represented and Unlock can no longer return
+		// ErrLockValueType. The sentinel stays exported, and HybridLocker
+		// still refuses to fall back on it, for callers matching on it.
 		_, _ = locker.Lock(key)
-
-		// Corrupt lockStore: store non-string value (simulate type assertion failure)
-		locker.lockStore.Store(key, 123)
-
-		err := locker.Unlock(key)
-		if err == nil {
-			t.Error("Unlock() with non-string lock value should return error")
-		}
-		if !errors.Is(err, ErrLockValueType) {
-			t.Errorf("Unlock() error = %v, want %v", err, ErrLockValueType)
+		if err := locker.Unlock(key); err != nil {
+			t.Errorf("Unlock() error = %v", err)
 		}
 	})
 }
@@ -355,8 +353,10 @@ func TestHybridLocker(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to local lock when Redis unavailable", func(t *testing.T) {
-		// Create a client that will fail operations
+	// A Redis outage must not be answered with a process-local lock by default.
+	// Doing so drops mutual exclusion between instances while reporting
+	// (true, nil), which is indistinguishable from a real distributed lock.
+	t.Run("reports the Redis failure instead of degrading to a local lock", func(t *testing.T) {
 		client := redis.NewClient(&redis.Options{
 			Addr: "invalid:6379",
 		})
@@ -365,19 +365,38 @@ func TestHybridLocker(t *testing.T) {
 		locker := NewHybridLocker(client)
 		key := "test-lock"
 
-		// Should fall back to local lock
+		success, err := locker.Lock(key)
+		if err == nil {
+			t.Error("HybridLocker.Lock() with failed Redis returned nil error; the caller cannot fail closed")
+		}
+		if !errors.Is(err, ErrRedisUnavailable) {
+			t.Errorf("HybridLocker.Lock() error = %v, want ErrRedisUnavailable", err)
+		}
+		if success {
+			t.Error("HybridLocker.Lock() with failed Redis = true; no lock was actually taken anywhere")
+		}
+	})
+
+	// The previous behaviour stays available for callers that genuinely accept
+	// losing exclusion, but it has to be asked for by name.
+	t.Run("opt-in local fallback still works", func(t *testing.T) {
+		client := redis.NewClient(&redis.Options{
+			Addr: "invalid:6379",
+		})
+		defer func() { _ = client.Close() }()
+
+		locker := NewHybridLockerWithLocalFallback(client)
+		key := "test-lock"
+
 		success, err := locker.Lock(key)
 		if err != nil {
-			t.Errorf("HybridLocker.Lock() with failed Redis error = %v, want nil (should fallback)", err)
+			t.Errorf("opt-in fallback Lock() error = %v, want nil", err)
 		}
 		if !success {
-			t.Error("HybridLocker.Lock() with failed Redis = false, want true (local lock should work)")
+			t.Error("opt-in fallback Lock() = false, want true")
 		}
-
-		// Should be able to unlock via local lock
-		err = locker.Unlock(key)
-		if err != nil {
-			t.Errorf("HybridLocker.Unlock() error = %v, want nil", err)
+		if err := locker.Unlock(key); err != nil {
+			t.Errorf("opt-in fallback Unlock() error = %v, want nil", err)
 		}
 	})
 
@@ -435,7 +454,7 @@ func TestHybridLocker(t *testing.T) {
 		client, mock := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
-		locker := NewHybridLocker(client)
+		locker := NewHybridLockerWithLocalFallback(client)
 		key := "test-lock"
 
 		// Lock via local (by making Redis fail)
@@ -462,7 +481,7 @@ func TestHybridLocker(t *testing.T) {
 
 		// Simulate another locker instance trying to unlock (wrong value in store)
 		locker2 := NewRedisLocker(client)
-		locker2.lockStore.Store(key, "wrong-value")
+		locker2.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		// Unlock with locker2 fails with "lock value mismatch or lock has expired"
 		err2 := locker2.Unlock(key)
 		if err2 == nil {
@@ -475,7 +494,7 @@ func TestHybridLocker(t *testing.T) {
 		hl := NewHybridLocker(client)
 		_, _ = hl.Lock(key) // now hl holds the lock
 		// Corrupt: make Redis think we have different value so Eval returns 0
-		hl.redisLocker.lockStore.Store(key, "wrong-value")
+		hl.redisLocker.storeEntry(key, lockEntry{token: "wrong-value", expires: time.Now().Add(time.Minute)})
 		err := hl.Unlock(key)
 		// Should return the mismatch error, not fall back to local
 		if err == nil {
@@ -557,4 +576,481 @@ func TestRedisLocker_Concurrent(t *testing.T) {
 			t.Errorf("concurrent Lock() successCount = %d, want 1", successCount)
 		}
 	})
+}
+
+// TestFallbackKeyIsNotReissuedThroughRedis is the regression test for a local
+// fallback acquisition being invisible to the Redis path.
+//
+// During an outage NewHybridLockerWithLocalFallback takes the key locally.
+// Once Redis recovers, a second Lock of the SAME key went to Redis and
+// succeeded -- two holders in one critical section -- and the first holder's
+// Unlock then tried Redis first and deleted the second holder's token while
+// leaving its own local lock behind.
+func TestFallbackKeyIsNotReissuedThroughRedis(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	// A client that cannot connect: the acquisition below degrades to local.
+	dead := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer func() { _ = dead.Close() }()
+
+	h := NewHybridLockerWithLocalFallback(dead)
+
+	ok, err := h.Lock("k")
+	if err != nil || !ok {
+		t.Fatalf("Lock during the outage = (%v, %v), want (true, nil) from the local fallback", ok, err)
+	}
+
+	// Redis comes back.
+	h.redisLocker = NewRedisLocker(client)
+
+	if ok, _ := h.Lock("k"); ok {
+		t.Error("a key held through the local fallback was handed out again via Redis")
+	}
+
+	// Someone else takes the key in Redis. The fallback holder's Unlock must
+	// not touch it.
+	other := NewRedisLocker(client)
+	if ok, err := other.Lock("k"); err != nil || !ok {
+		t.Fatalf("the Redis holder could not take the key: (%v, %v)", ok, err)
+	}
+
+	if err := h.Unlock("k"); err != nil {
+		t.Errorf("Unlock of the fallback acquisition = %v, want nil", err)
+	}
+	if ok, _ := other.Lock("k"); ok {
+		t.Error("the fallback holder's Unlock deleted the Redis holder's lock")
+	}
+}
+
+// TestRedisHeldKeyIsNotGrantedLocally is the regression test for the REVERSE
+// transition of the round-3 fix: a key taken through Redis, with Redis then
+// becoming unavailable before it is released.
+//
+// The second Lock found no fallback record, got a Redis error, and took the
+// local lock -- two callers in one critical section. Worse, the record is
+// keyed by KEY, so the Redis holder's own Unlock then found the local marker
+// and released the SECOND caller's lock.
+func TestRedisHeldKeyIsNotGrantedLocally(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	h := NewHybridLockerWithLocalFallback(client)
+
+	// Taken through a healthy Redis.
+	ok, err := h.Lock("k")
+	if err != nil || !ok {
+		t.Fatalf("Lock through Redis = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// Redis goes away while that lease is still held.
+	dead := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer func() { _ = dead.Close() }()
+	h.redisLocker = NewRedisLocker(dead)
+
+	if ok, _ := h.Lock("k"); ok {
+		t.Error("a key held through Redis was granted again through the local fallback")
+	}
+
+	// A DIFFERENT key may still degrade -- that is what the mode is for.
+	if ok, err := h.Lock("other"); err != nil || !ok {
+		t.Errorf("Lock of an unheld key during the outage = (%v, %v), want the fallback to grant it", ok, err)
+	}
+}
+
+// TestFallbackRequiresExpiredRedisRouteToBeConsumed covers an elapsed
+// Redis-backed Hybrid acquisition. Its lease no longer blocks Redis attempts,
+// but key-only Unlock cannot distinguish that caller from a later local one;
+// local fallback therefore remains closed until the FIFO route is consumed.
+func TestFallbackRequiresExpiredRedisRouteToBeConsumed(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+	h := NewHybridLockerWithLocalFallback(client)
+
+	if ok, err := h.Lock("abandoned"); err != nil || !ok {
+		t.Fatalf("initial Redis Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+	h.heldMu.Lock()
+	state := h.held["abandoned"]
+	if state == nil || state.redis != 1 || state.redisUntil.IsZero() {
+		h.heldMu.Unlock()
+		t.Fatalf("recorded Redis state = %#v, want one acquisition with an expiry bound", state)
+	}
+	// Deterministically model that bound passing. Delete the mock Redis key as
+	// well, so the state agrees with the server-side lease having expired.
+	past := time.Now().Add(-time.Second)
+	state.redisUntil = past
+	h.heldMu.Unlock()
+	h.redisLocker.mu.Lock()
+	h.redisLocker.lockStore["abandoned"].entries[0].expires = past
+	h.redisLocker.mu.Unlock()
+	if err := client.Del(context.Background(), "abandoned").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SetShouldFail(true)
+	defer mock.SetShouldFail(false)
+	if ok, err := h.Lock("abandoned"); ok || !errors.Is(err, ErrLockExpired) {
+		t.Fatalf("Lock with an unconsumed Redis route = (%v, %v), want fail-closed ErrLockExpired", ok, err)
+	}
+	// The original Redis caller arrives late and consumes its own route without
+	// issuing a Redis command.
+	if err := h.Unlock("abandoned"); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("stale Redis Unlock = %v, want ErrLockExpired", err)
+	}
+	// With the ambiguous route gone, explicit local fallback can recover.
+	if ok, err := h.Lock("abandoned"); err != nil || !ok {
+		t.Fatalf("Lock after consuming Redis route = (%v, %v), want local fallback", ok, err)
+	}
+	if err := h.Unlock("abandoned"); err != nil {
+		t.Errorf("local fallback Unlock = %v", err)
+	}
+}
+
+// TestFallbackRoutingIsSerializedPerKey is the regression test for holding a
+// single mutex across every Redis call in fallback mode. One slow key made all
+// unrelated keys queue behind its operation timeout, while the routing
+// invariant only requires decisions for the same key to be indivisible.
+func TestFallbackRoutingIsSerializedPerKey(t *testing.T) {
+	t.Run("different keys proceed independently", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewHybridLockerWithLocalFallback(client)
+		type result struct {
+			ok  bool
+			err error
+		}
+		firstDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("slow-key")
+			firstDone <- result{ok: ok, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("first key did not reach the delayed-reply window")
+		}
+
+		secondDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("independent-key")
+			secondDone <- result{ok: ok, err: err}
+		}()
+
+		var second result
+		blocked := false
+		select {
+		case second = <-secondDone:
+		case <-time.After(250 * time.Millisecond):
+			blocked = true
+		}
+		close(hook.unblock)
+		first := <-firstDone
+		if blocked {
+			second = <-secondDone
+			t.Fatal("an unrelated key was blocked by the first key's Redis reply")
+		}
+		if !first.ok || first.err != nil {
+			t.Errorf("first Lock = (%v, %v), want (true, nil)", first.ok, first.err)
+		}
+		if !second.ok || second.err != nil {
+			t.Errorf("second Lock = (%v, %v), want (true, nil)", second.ok, second.err)
+		}
+	})
+
+	t.Run("same key remains indivisible", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewHybridLockerWithLocalFallback(client)
+		type result struct {
+			ok  bool
+			err error
+		}
+		firstDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("same-key")
+			firstDone <- result{ok: ok, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("first acquisition did not reach the delayed-reply window")
+		}
+		// Redis is lost after accepting the first lock but before its caller
+		// records the backend. A concurrent same-key decision must wait for that
+		// record rather than granting a local fallback.
+		mock.SetShouldFail(true)
+		secondDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("same-key")
+			secondDone <- result{ok: ok, err: err}
+		}()
+
+		returnedEarly := false
+		select {
+		case <-secondDone:
+			returnedEarly = true
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(hook.unblock)
+		first := <-firstDone
+		if returnedEarly {
+			t.Fatal("a same-key routing decision completed before the first was recorded")
+		}
+		second := <-secondDone
+		if !first.ok || first.err != nil {
+			t.Errorf("first Lock = (%v, %v), want (true, nil)", first.ok, first.err)
+		}
+		if second.ok || !errors.Is(second.err, ErrRedisUnavailable) {
+			t.Errorf("same-key Lock during outage = (%v, %v), want refusal with ErrRedisUnavailable", second.ok, second.err)
+		}
+	})
+}
+
+// TestFallbackPreservesLateLeaseCleanupFailure covers the dual-classified
+// error from a successful SET that arrived too late and whose token cleanup
+// then failed. It matches ErrLockExpired and ErrRedisUnavailable; expiration
+// must win so Hybrid never hides the uncertain Redis lock with a local grant.
+func TestFallbackPreservesLateLeaseCleanupFailure(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	hook := newCommandQueueDelayHook("set", "")
+	hook.after = func() { mock.SetShouldFail(true) }
+	client.AddHook(hook)
+	locker := NewHybridLockerWithLocalFallback(client)
+	locker.redisLocker.lockTime = 500 * time.Millisecond
+
+	type result struct {
+		ok  bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ok, err := locker.Lock("late-cleanup")
+		done <- result{ok: ok, err: err}
+	}()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Lock did not reach the queued-command window")
+	}
+	time.Sleep(520 * time.Millisecond)
+	close(hook.unblock)
+	got := <-done
+	if got.ok || !errors.Is(got.err, ErrLockExpired) || !errors.Is(got.err, ErrRedisUnavailable) {
+		t.Errorf("Hybrid Lock after failed late cleanup = (%v, %v), want false and both sentinels", got.ok, got.err)
+	}
+
+	// The next call sees the uncertain Redis-backed marker and cannot turn the
+	// same outage into a local grant.
+	if ok, err := locker.Lock("late-cleanup"); ok || !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("retry during the uncertain lease = (%v, %v), want refusal", ok, err)
+	}
+
+	// Redis executed SET before the first error was returned, so one TTL from
+	// that reply is a safe upper bound. Once it passes, fallback is available
+	// again rather than leaving an unbounded tombstone.
+	time.Sleep(520 * time.Millisecond)
+	if ok, err := locker.Lock("late-cleanup"); err != nil || !ok {
+		t.Errorf("retry after the uncertainty deadline = (%v, %v), want local fallback", ok, err)
+	}
+}
+
+// TestLegacyQueueFollowsRedisOrder is the regression test for enqueueing
+// outside the SET. Apart, the queue is ordered by reply completion rather than
+// by Redis execution, so a delayed reply could file the LATER acquisition
+// first and the earlier caller's Unlock -- which takes the oldest entry --
+// would pop the live token of the one still working.
+func TestLegacyQueueFollowsRedisOrder(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	locker := NewRedisLocker(client)
+	locker.lockTime = 50 * time.Millisecond
+
+	// Two acquisitions of one key straddling the lease, concurrently.
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for attempt := 0; attempt < 40; attempt++ {
+				if ok, err := locker.Lock("k"); err == nil && ok {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// However the replies interleaved, every recorded entry must be in
+	// non-decreasing expiry order: that is what makes "oldest first" mean
+	// "the earliest acquisition".
+	locker.mu.Lock()
+	q := locker.lockStore["k"]
+	locker.mu.Unlock()
+	if q == nil || len(q.entries) < 2 {
+		t.Skipf("only %d acquisitions recorded; the lease did not elapse between them", len(q.entries))
+	}
+	for i := 1; i < len(q.entries); i++ {
+		if q.entries[i].expires.Before(q.entries[i-1].expires) {
+			t.Errorf("entry %d expires before entry %d; the queue is not in acquisition order", i, i-1)
+		}
+	}
+}
+
+// TestUnlockTransportFailureIsClassified is the regression test for
+// RedisLocker.Unlock wrapping the raw redis error. HybridLocker's guard tested
+// for ErrRedisUnavailable there and never saw it, so every outage looked
+// definitive and the guard that stops a local fallback being granted for a key
+// Redis may still hold was inert.
+func TestUnlockTransportFailureIsClassified(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	locker := NewRedisLocker(client)
+
+	ok, err := locker.Lock("k")
+	if err != nil || !ok {
+		t.Fatalf("Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// The connection dies while the lease is still held.
+	_ = client.Close()
+
+	err = locker.Unlock("k")
+	if err == nil {
+		t.Fatal("Unlock on a dead connection returned nil")
+	}
+	if !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("Unlock error = %v, want it to wrap ErrRedisUnavailable", err)
+	}
+	// And it must NOT look like a verdict about the lock.
+	if errors.Is(err, ErrLockExpired) || errors.Is(err, ErrLockValueMismatch) {
+		t.Errorf("Unlock error = %v, want no verdict about the lock", err)
+	}
+}
+
+// TestFallbackWaitsForEveryRedisAcquisition is the regression test for the
+// key-level backend marker. One locker can hold the same key more than once --
+// the legacy queue allows reacquiring after a lease elapses -- and the first
+// definitive unlock cleared the marker while the newer lock was still live, so
+// a local fallback could be granted alongside it.
+func TestFallbackWaitsForEveryRedisAcquisition(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	h := NewHybridLockerWithLocalFallback(client)
+	h.redisLocker.lockTime = 40 * time.Millisecond
+
+	// First acquisition.
+	if ok, err := h.Lock("k"); err != nil || !ok {
+		t.Fatalf("first Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+	// Its lease elapses and the key is taken again by this same locker.
+	time.Sleep(60 * time.Millisecond)
+	// Give the second acquisition a long lease so scheduler or CI load cannot
+	// make it expire before the assertion below.
+	h.redisLocker.lockTime = time.Minute
+	if ok, err := h.Lock("k"); err != nil || !ok {
+		t.Fatalf("second Lock = (%v, %v), want (true, nil) after the lease elapsed", ok, err)
+	}
+
+	// The FIRST holder finally unlocks. Its lease is gone, so this is
+	// definitive -- but the second acquisition is still outstanding.
+	if err := h.Unlock("k"); !errors.Is(err, ErrLockExpired) {
+		t.Fatalf("first Unlock = %v, want ErrLockExpired", err)
+	}
+
+	// Redis now goes away. The still-live second acquisition must keep the
+	// key off the local fallback.
+	dead := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	defer func() { _ = dead.Close() }()
+	h.redisLocker = NewRedisLocker(dead)
+
+	if ok, _ := h.Lock("k"); ok {
+		t.Error("a key with a live Redis acquisition outstanding was granted through the local fallback")
+	}
+}
+
+// --- Codex review round 6 (PR #3) ---
+
+// TestAmbiguousUnlockKeepsItsAcquisition is the regression test for consuming
+// the queue entry on a transport failure.
+//
+// ErrRedisUnavailable is explicitly NOT a verdict about the lock, but Unlock
+// had already popped the acquisition before asking Redis, so the entry was
+// gone either way. Once that lease expired and the same locker took the key
+// again, retrying the original Unlock reached for the NEXT entry and
+// compare-and-deleted a lock that was still live -- the lock-stealing this
+// queue exists to prevent, through the one path that looks like a retry.
+func TestAmbiguousUnlockKeepsItsAcquisition(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	locker := NewRedisLockerWithLockTime(client, 60*time.Millisecond)
+
+	if ok, err := locker.Lock("k"); err != nil || !ok {
+		t.Fatalf("first Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// Redis fails while the lease is still held: no verdict either way.
+	mock.SetShouldFail(true)
+	if err := locker.Unlock("k"); !errors.Is(err, ErrRedisUnavailable) {
+		t.Fatalf("Unlock during an outage = %v, want ErrRedisUnavailable", err)
+	}
+	mock.SetShouldFail(false)
+
+	// The lease elapses and the SAME locker takes the key again.
+	time.Sleep(90 * time.Millisecond)
+	if ok, err := locker.Lock("k"); err != nil || !ok {
+		t.Fatalf("second Lock = (%v, %v), want (true, nil) after the lease elapsed", ok, err)
+	}
+
+	locker.mu.Lock()
+	q := locker.lockStore["k"]
+	if q == nil || len(q.entries) == 0 {
+		locker.mu.Unlock()
+		t.Fatal("the second acquisition was not recorded")
+	}
+	liveToken := q.entries[len(q.entries)-1].token
+	locker.mu.Unlock()
+
+	// The caller retries the Unlock that got no verdict. It must consume ITS
+	// OWN acquisition -- long expired -- and never reach Redis.
+	if err := locker.Unlock("k"); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("retried Unlock = %v, want ErrLockExpired for its own elapsed lease", err)
+	}
+
+	got, err := client.Get(context.Background(), "k").Result()
+	if err != nil {
+		t.Fatalf("the live second lock was deleted by the retried Unlock: %v", err)
+	}
+	if got != liveToken {
+		t.Errorf("Redis holds %q, want the second acquisition's token %q", got, liveToken)
+	}
 }
