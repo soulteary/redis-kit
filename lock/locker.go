@@ -180,8 +180,9 @@ func (r *RedisLocker) takeOldest(key string) (lockEntry, bool) {
 // Only releases the lock if the lock value matches, preventing accidental
 // release of another process's lock.
 //
-// It consumes the OLDEST outstanding acquisition of key, which is this
-// caller's own in the paired usage this API assumes. The key alone cannot
+// It consumes the OLDEST outstanding acquisition of key -- and only on a
+// DEFINITIVE result -- which is this caller's own in the paired usage this API
+// assumes. The key alone cannot
 // identify the caller, so when two holders of one key finish out of order --
 // the second one's lease outliving the first's -- the second's Unlock takes
 // the first's expired entry, reports ErrLockExpired, and leaves its own lock
@@ -223,6 +224,14 @@ func (r *RedisLocker) Unlock(key string) error {
 	`
 	result, err := r.client.Eval(ctx, script, []string{key}, lockValue).Result()
 	if err != nil {
+		// The entry goes BACK, at the front. ErrRedisUnavailable is not a
+		// verdict about the lock, so consuming the acquisition on one would
+		// point a retried Unlock at the NEXT entry: once this lease expired
+		// and the same locker acquired the key again, that retry would
+		// compare-and-delete the new, live lock. An acquisition is consumed
+		// only by a definitive result.
+		r.restoreOldest(key, entry)
+
 		// Classified, not just wrapped. A transport failure is NOT a verdict
 		// about the lock -- the lease may still be held -- and callers have to
 		// be able to tell it apart from ErrLockExpired or a value mismatch.
@@ -468,6 +477,27 @@ func (h *HybridLocker) Unlock(key string) error {
 //
 // Only Lock and the package's own tests use it; callers identify a lock by
 // key alone through the legacy API and have nothing to pass here.
+// restoreOldest puts an acquisition back at the front of key's queue after an
+// Unlock that got no verdict, so the retry consumes the same one.
+func (r *RedisLocker) restoreOldest(key string, entry lockEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	q := r.lockStore[key]
+	if q == nil {
+		q = &keyQueue{}
+		r.lockStore[key] = q
+	}
+
+	// At the FRONT: it is still the oldest outstanding acquisition, and any
+	// entry appended while Redis was being asked is newer than it.
+	q.entries = append([]lockEntry{entry}, q.entries...)
+	if over := len(q.entries) - maxOutstandingPerKey; over > 0 {
+		q.entries = q.entries[over:]
+		q.tombstones += over
+	}
+}
+
 func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

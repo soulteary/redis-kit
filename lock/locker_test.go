@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -779,5 +780,63 @@ func TestFallbackWaitsForEveryRedisAcquisition(t *testing.T) {
 
 	if ok, _ := h.Lock("k"); ok {
 		t.Error("a key with a live Redis acquisition outstanding was granted through the local fallback")
+	}
+}
+
+// --- Codex review round 6 (PR #3) ---
+
+// TestAmbiguousUnlockKeepsItsAcquisition is the regression test for consuming
+// the queue entry on a transport failure.
+//
+// ErrRedisUnavailable is explicitly NOT a verdict about the lock, but Unlock
+// had already popped the acquisition before asking Redis, so the entry was
+// gone either way. Once that lease expired and the same locker took the key
+// again, retrying the original Unlock reached for the NEXT entry and
+// compare-and-deleted a lock that was still live -- the lock-stealing this
+// queue exists to prevent, through the one path that looks like a retry.
+func TestAmbiguousUnlockKeepsItsAcquisition(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	locker := NewRedisLockerWithLockTime(client, 60*time.Millisecond)
+
+	if ok, err := locker.Lock("k"); err != nil || !ok {
+		t.Fatalf("first Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// Redis fails while the lease is still held: no verdict either way.
+	mock.SetShouldFail(true)
+	if err := locker.Unlock("k"); !errors.Is(err, ErrRedisUnavailable) {
+		t.Fatalf("Unlock during an outage = %v, want ErrRedisUnavailable", err)
+	}
+	mock.SetShouldFail(false)
+
+	// The lease elapses and the SAME locker takes the key again.
+	time.Sleep(90 * time.Millisecond)
+	if ok, err := locker.Lock("k"); err != nil || !ok {
+		t.Fatalf("second Lock = (%v, %v), want (true, nil) after the lease elapsed", ok, err)
+	}
+
+	locker.mu.Lock()
+	q := locker.lockStore["k"]
+	if q == nil || len(q.entries) == 0 {
+		locker.mu.Unlock()
+		t.Fatal("the second acquisition was not recorded")
+	}
+	liveToken := q.entries[len(q.entries)-1].token
+	locker.mu.Unlock()
+
+	// The caller retries the Unlock that got no verdict. It must consume ITS
+	// OWN acquisition -- long expired -- and never reach Redis.
+	if err := locker.Unlock("k"); !errors.Is(err, ErrLockExpired) {
+		t.Errorf("retried Unlock = %v, want ErrLockExpired for its own elapsed lease", err)
+	}
+
+	got, err := client.Get(context.Background(), "k").Result()
+	if err != nil {
+		t.Fatalf("the live second lock was deleted by the retried Unlock: %v", err)
+	}
+	if got != liveToken {
+		t.Errorf("Redis holds %q, want the second acquisition's token %q", got, liveToken)
 	}
 }
