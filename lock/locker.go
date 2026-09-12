@@ -308,8 +308,8 @@ type HybridLocker struct {
 // backend, plus the upper bound for a late Redis acquisition whose cleanup
 // failed. At most one backend count is non-zero: Lock refuses to mix them.
 type backendCounts struct {
-	redis         int
-	local         int
+	redis          int
+	local          int
 	uncertainUntil time.Time
 }
 
