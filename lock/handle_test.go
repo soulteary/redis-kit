@@ -20,10 +20,17 @@ import (
 type delayReplyHook struct {
 	command   string
 	scriptTag string
+	before    bool
 	processed chan struct{}
 	unblock   chan struct{}
 	mu        sync.Mutex
 	claimed   bool
+}
+
+func newCommandQueueDelayHook(command, scriptTag string) *delayReplyHook {
+	h := newDelayReplyHook(command, scriptTag)
+	h.before = true
+	return h
 }
 
 func newDelayReplyHook(command, scriptTag string) *delayReplyHook {
@@ -43,21 +50,26 @@ func (h *delayReplyHook) DialHook(next redis.DialHook) redis.DialHook {
 
 func (h *delayReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		err := next(ctx, cmd)
 		args := cmd.Args()
 		matches := len(args) > 0 && strings.EqualFold(fmt.Sprint(args[0]), h.command)
 		if matches && h.scriptTag != "" {
 			matches = len(args) > 1 && strings.Contains(fmt.Sprint(args[1]), h.scriptTag)
 		}
+		block := false
 		if matches {
 			h.mu.Lock()
-			block := !h.claimed
+			block = !h.claimed
 			h.claimed = true
 			h.mu.Unlock()
-			if block {
-				close(h.processed)
-				<-h.unblock
-			}
+		}
+		if block && h.before {
+			close(h.processed)
+			<-h.unblock
+		}
+		err := next(ctx, cmd)
+		if block && !h.before {
+			close(h.processed)
+			<-h.unblock
 		}
 		return err
 	}
@@ -285,7 +297,7 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
-		hook := newDelayReplyHook("set", "")
+		hook := newCommandQueueDelayHook("set", "")
 		client.AddHook(hook)
 		locker := NewRedisLocker(client)
 		type result struct {
@@ -294,7 +306,7 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 		}
 		done := make(chan result, 1)
 		go func() {
-			h, err := locker.Acquire(context.Background(), "late-acquire", 10*time.Millisecond)
+			h, err := locker.Acquire(context.Background(), "late-acquire", 100*time.Millisecond)
 			done <- result{handle: h, err: err}
 		}()
 
@@ -304,11 +316,14 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 			close(hook.unblock)
 			t.Fatal("Acquire did not reach the delayed-reply window")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(120 * time.Millisecond)
 		close(hook.unblock)
 		got := <-done
 		if got.handle != nil || !errors.Is(got.err, ErrLockExpired) {
 			t.Errorf("Acquire after its deadline = (%v, %v), want (nil, ErrLockExpired)", got.handle, got.err)
+		}
+		if _, err := client.Get(context.Background(), "late-acquire").Result(); !errors.Is(err, redis.Nil) {
+			t.Errorf("rejected Acquire left its token in Redis: %v", err)
 		}
 	})
 
@@ -322,10 +337,10 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 			t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
 		}
 		previous := h.ExpiresAt()
-		hook := newDelayReplyHook("eval", "redis-kit:lock-extend")
+		hook := newCommandQueueDelayHook("eval", "redis-kit:lock-extend")
 		client.AddHook(hook)
 		done := make(chan error, 1)
-		go func() { done <- h.Extend(context.Background(), 10*time.Millisecond) }()
+		go func() { done <- h.Extend(context.Background(), 100*time.Millisecond) }()
 
 		select {
 		case <-hook.processed:
@@ -333,7 +348,7 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 			close(hook.unblock)
 			t.Fatal("Extend did not reach the delayed-reply window")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(120 * time.Millisecond)
 		close(hook.unblock)
 		if err := <-done; !errors.Is(err, ErrLockExpired) {
 			t.Errorf("Extend after its deadline = %v, want ErrLockExpired", err)
@@ -341,15 +356,18 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 		if got := h.ExpiresAt(); !got.Equal(previous) {
 			t.Errorf("late Extend published deadline %s, want previous %s", got, previous)
 		}
+		if _, err := client.Get(context.Background(), "late-extend").Result(); !errors.Is(err, redis.Nil) {
+			t.Errorf("rejected Extend left its renewed token in Redis: %v", err)
+		}
 	})
 
 	t.Run("legacy Lock", func(t *testing.T) {
 		client, _ := testutil.NewMockRedisClient()
 		defer func() { _ = client.Close() }()
 
-		hook := newDelayReplyHook("set", "")
+		hook := newCommandQueueDelayHook("set", "")
 		client.AddHook(hook)
-		locker := NewRedisLockerWithLockTime(client, 10*time.Millisecond)
+		locker := NewRedisLockerWithLockTime(client, 100*time.Millisecond)
 		type result struct {
 			ok  bool
 			err error
@@ -366,7 +384,7 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 			close(hook.unblock)
 			t.Fatal("Lock did not reach the delayed-reply window")
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(120 * time.Millisecond)
 		close(hook.unblock)
 		got := <-done
 		if got.ok || !errors.Is(got.err, ErrLockExpired) {
@@ -374,6 +392,9 @@ func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
 		}
 		if outstanding := locker.outstanding("late-legacy"); outstanding != 0 {
 			t.Errorf("late Lock recorded %d outstanding acquisition(s), want 0", outstanding)
+		}
+		if _, err := client.Get(context.Background(), "late-legacy").Result(); !errors.Is(err, redis.Nil) {
+			t.Errorf("rejected Lock left its token in Redis: %v", err)
 		}
 	})
 }

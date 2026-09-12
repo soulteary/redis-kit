@@ -148,7 +148,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 		// As with Handle.Acquire, a reply received after the conservative
 		// deadline must not let the caller begin work as a holder.
 		if !time.Now().Before(deadline) {
-			return false, ErrLockExpired
+			return false, rejectLateLease(ctx, r.client, key, lockValue)
 		}
 		// Append rather than replace: a previous holder of this key may not
 		// have unlocked yet, and its Unlock must find ITS entry, not this one.

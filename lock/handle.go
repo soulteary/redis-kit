@@ -20,6 +20,19 @@ else
 end
 `
 
+// rejectLateLease removes a lock whose successful reply arrived after the
+// caller's conservative deadline. The command may have waited in the client
+// pool and only just executed, so Redis can still hold the token for its full
+// TTL even though it is no longer safe to hand ownership to the caller.
+func rejectLateLease(ctx context.Context, client *redis.Client, key, token string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultOperationTimeout)
+	defer cancel()
+	if _, err := client.Eval(cleanupCtx, releaseScript, []string{key}, token).Result(); err != nil {
+		return fmt.Errorf("%w: cleanup rejected lease %q: %w: %w", ErrLockExpired, key, ErrRedisUnavailable, err)
+	}
+	return ErrLockExpired
+}
+
 // extendScript refreshes the TTL only if the key still carries our token.
 const extendScript = `
 -- redis-kit:lock-extend
@@ -124,7 +137,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	// acquired by somebody else before this caller can enter its critical
 	// section, so never hand out an already-expired Handle.
 	if !time.Now().Before(deadline) {
-		return nil, ErrLockExpired
+		return nil, rejectLateLease(ctx, l.client, key, token)
 	}
 
 	return &Handle{client: l.client, key: key, token: token, expires: deadline}, nil
@@ -200,7 +213,7 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// has elapsed while its reply was in flight. The key can already be free
 	// or held by another caller at this point.
 	if !time.Now().Before(deadline) {
-		return ErrLockExpired
+		return rejectLateLease(ctx, h.client, h.key, h.token)
 	}
 
 	h.mu.Lock()
