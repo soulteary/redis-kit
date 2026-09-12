@@ -25,6 +25,7 @@ type delayReplyHook struct {
 	unblock   chan struct{}
 	mu        sync.Mutex
 	claimed   bool
+	after     func()
 }
 
 func newCommandQueueDelayHook(command, scriptTag string) *delayReplyHook {
@@ -67,6 +68,9 @@ func (h *delayReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 			<-h.unblock
 		}
 		err := next(ctx, cmd)
+		if block && h.after != nil {
+			h.after()
+		}
 		if block && !h.before {
 			close(h.processed)
 			<-h.unblock

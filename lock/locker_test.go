@@ -776,6 +776,49 @@ func TestFallbackRoutingIsSerializedPerKey(t *testing.T) {
 	})
 }
 
+// TestFallbackPreservesLateLeaseCleanupFailure covers the dual-classified
+// error from a successful SET that arrived too late and whose token cleanup
+// then failed. It matches ErrLockExpired and ErrRedisUnavailable; expiration
+// must win so Hybrid never hides the uncertain Redis lock with a local grant.
+func TestFallbackPreservesLateLeaseCleanupFailure(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	hook := newCommandQueueDelayHook("set", "")
+	hook.after = func() { mock.SetShouldFail(true) }
+	client.AddHook(hook)
+	locker := NewHybridLockerWithLocalFallback(client)
+	locker.redisLocker.lockTime = 100 * time.Millisecond
+
+	type result struct {
+		ok  bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ok, err := locker.Lock("late-cleanup")
+		done <- result{ok: ok, err: err}
+	}()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Lock did not reach the queued-command window")
+	}
+	time.Sleep(120 * time.Millisecond)
+	close(hook.unblock)
+	got := <-done
+	if got.ok || !errors.Is(got.err, ErrLockExpired) || !errors.Is(got.err, ErrRedisUnavailable) {
+		t.Errorf("Hybrid Lock after failed late cleanup = (%v, %v), want false and both sentinels", got.ok, got.err)
+	}
+
+	// A hidden fallback would already occupy the local key.
+	if ok, err := locker.localLocker.Lock("late-cleanup"); err != nil || !ok {
+		t.Errorf("local key was occupied after rejected fallback: (%v, %v)", ok, err)
+	}
+}
+
 // TestLegacyQueueFollowsRedisOrder is the regression test for enqueueing
 // outside the SET. Apart, the queue is ordered by reply completion rather than
 // by Redis execution, so a delayed reply could file the LATER acquisition

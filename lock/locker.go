@@ -441,7 +441,10 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			// Only an unavailable Redis activates the explicit fallback. A
 			// definitive error such as an acquisition reply arriving after its
 			// lease deadline must be reported, not converted into a local grant.
-			if !errors.Is(err, ErrRedisUnavailable) {
+			// Test expiration first: failed cleanup of a late lease deliberately
+			// matches BOTH sentinels, and its uncertain Redis lock makes local
+			// fallback especially unsafe.
+			if errors.Is(err, ErrLockExpired) || !errors.Is(err, ErrRedisUnavailable) {
 				return false, err
 			}
 			// Explicitly opted in: mutual exclusion across instances is now lost.
