@@ -28,9 +28,11 @@ type RedisLocker struct {
 	// mu guards lockStore.
 	mu sync.Mutex
 
-	// acquireMu serialises the SET with the enqueue that records it, per key,
-	// so the queue's order is Redis's execution order.
-	acquireMu keyedMutex
+	// operationMu serialises each legacy Lock/Unlock operation per key. Lock
+	// keeps SET and enqueue in Redis execution order; Unlock keeps dequeue,
+	// Eval and a possible restore indivisible so concurrent transport failures
+	// cannot restore entries in reply-completion order and reorder the queue.
+	operationMu keyedMutex
 
 	// lockStore maps key -> the outstanding acquisitions for that key, for the
 	// legacy Lock/Unlock pair -- which identifies a lock by key alone and so
@@ -128,7 +130,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	// acquire and reply first, and the queue records B before A. A's Unlock --
 	// which takes the OLDEST entry -- would then pop B's live token and delete
 	// a lock B is still holding.
-	release := r.acquireMu.lock(key)
+	release := r.operationMu.lock(key)
 	defer release()
 
 	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
@@ -194,6 +196,15 @@ func (r *RedisLocker) Unlock(key string) error {
 	if r.client == nil {
 		return fmt.Errorf("redis client is nil")
 	}
+
+	// Dequeue, Redis verdict and a possible restore are one operation per key.
+	// Without this, two failed Unlock calls can restore their entries in the
+	// opposite order: whichever Redis error returns last is prepended last.
+	// A later retry can then consume the newer live token and release a lock it
+	// did not acquire. The same mutex is used by Lock, so an acquisition cannot
+	// be inserted into the queue halfway through this transaction either.
+	release := r.operationMu.lock(key)
+	defer release()
 
 	// Take the OLDEST outstanding acquisition for this key, which is this
 	// caller's own in the paired usage the legacy API assumes.
