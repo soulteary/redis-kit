@@ -83,6 +83,9 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	if ttl <= 0 {
 		ttl = l.lockTime
 	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("acquire ttl must be positive after applying the configured default, got %s", ttl)
+	}
 
 	token, err := generateLockValue()
 	if err != nil {
@@ -109,7 +112,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 		return nil, nil // held by somebody else
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: acquire %q: %v", ErrRedisUnavailable, key, err)
+		return nil, fmt.Errorf("%w: acquire %q: %w", ErrRedisUnavailable, key, err)
 	}
 
 	return &Handle{client: l.client, key: key, token: token, expires: issued.Add(ttl)}, nil
@@ -127,7 +130,7 @@ func (h *Handle) Release(ctx context.Context) error {
 
 	res, err := h.client.Eval(ctx, releaseScript, []string{h.key}, h.token).Result()
 	if err != nil {
-		return fmt.Errorf("%w: release %q: %v", ErrRedisUnavailable, h.key, err)
+		return fmt.Errorf("%w: release %q: %w", ErrRedisUnavailable, h.key, err)
 	}
 	if n, ok := res.(int64); !ok || n == 0 {
 		if time.Now().After(h.ExpiresAt()) {
@@ -172,7 +175,7 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 
 	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, ttl.Milliseconds()).Result()
 	if err != nil {
-		return fmt.Errorf("%w: extend %q: %v", ErrRedisUnavailable, h.key, err)
+		return fmt.Errorf("%w: extend %q: %w", ErrRedisUnavailable, h.key, err)
 	}
 	if n, ok := res.(int64); !ok || n == 0 {
 		return ErrLockExpired

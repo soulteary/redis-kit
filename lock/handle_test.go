@@ -183,6 +183,41 @@ func TestAcquireDefaultsTTL(t *testing.T) {
 	}
 }
 
+func TestAcquireRejectsInvalidConfiguredDefaultTTL(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	l := NewRedisLockerWithLockTime(client, 0)
+	h, err := l.Acquire(context.Background(), "invalid-default", 0)
+	if h != nil {
+		t.Fatal("Acquire() returned a handle for a non-positive effective ttl")
+	}
+	if err == nil {
+		t.Fatal("Acquire() accepted a non-positive configured default ttl")
+	}
+}
+
+func TestHandleErrorsPreserveCallerCancellation(t *testing.T) {
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	l := NewRedisLocker(client)
+	if _, err := l.Acquire(ctx, "acquire-cancelled", time.Minute); !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("Acquire() error = %v, want both context.Canceled and ErrRedisUnavailable", err)
+	}
+
+	h := &Handle{client: client, key: "held", token: "token", expires: time.Now().Add(time.Minute)}
+	if err := h.Release(ctx); !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("Release() error = %v, want both context.Canceled and ErrRedisUnavailable", err)
+	}
+	if err := h.Extend(ctx, time.Minute); !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("Extend() error = %v, want both context.Canceled and ErrRedisUnavailable", err)
+	}
+}
+
 func TestNilHandleOperations(t *testing.T) {
 	var h *Handle
 	if err := h.Release(context.Background()); !errors.Is(err, ErrLockNotHeld) {

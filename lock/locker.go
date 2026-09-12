@@ -115,6 +115,9 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	if r.client == nil {
 		return false, fmt.Errorf("redis client is nil")
 	}
+	if r.lockTime <= 0 {
+		return false, fmt.Errorf("lock time must be positive, got %s", r.lockTime)
+	}
 
 	lockValue, err := generateLockValue()
 	if err != nil {
@@ -135,7 +138,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 
 	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
 	if err != nil && err != redis.Nil {
-		return false, fmt.Errorf("%w: failed to acquire lock: %v", ErrRedisUnavailable, err)
+		return false, fmt.Errorf("%w: failed to acquire lock: %w", ErrRedisUnavailable, err)
 	}
 	res := (err == nil)
 	if res {
@@ -250,7 +253,7 @@ func (r *RedisLocker) Unlock(key string) error {
 		// never saw it, so it treated every outage as definitive and dropped
 		// the record that stops a local fallback being granted for a key
 		// Redis may still hold.
-		return fmt.Errorf("%w: failed to release lock: %v", ErrRedisUnavailable, err)
+		return fmt.Errorf("%w: failed to release lock: %w", ErrRedisUnavailable, err)
 	}
 
 	// Check if lock was actually released
@@ -408,7 +411,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 				}
 				return success, nil
 			}
-			return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
+			return false, fmt.Errorf("%w: %w", ErrRedisUnavailable, err)
 
 		default:
 			success, err := h.redisLocker.Lock(key)
@@ -433,7 +436,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 		if err == nil {
 			return success, nil
 		}
-		return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
+		return false, fmt.Errorf("%w: %w", ErrRedisUnavailable, err)
 	}
 
 	return h.localLocker.Lock(key)
