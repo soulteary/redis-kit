@@ -15,38 +15,55 @@ import (
 	"github.com/soulteary/redis-kit/testutil"
 )
 
-// delayExtendReplyHook pauses the caller after Redis has processed an Extend
-// but before Extend can publish its deadline and return. That opens the exact
-// window in which an unserialized Release could delete the key and return
-// success first.
-type delayExtendReplyHook struct {
+// delayReplyHook pauses the first matching caller after Redis has processed a
+// command but before the caller can act on its reply.
+type delayReplyHook struct {
+	command   string
+	scriptTag string
 	processed chan struct{}
 	unblock   chan struct{}
-	once      sync.Once
+	mu        sync.Mutex
+	claimed   bool
 }
 
-func (h *delayExtendReplyHook) DialHook(next redis.DialHook) redis.DialHook {
+func newDelayReplyHook(command, scriptTag string) *delayReplyHook {
+	return &delayReplyHook{
+		command:   command,
+		scriptTag: scriptTag,
+		processed: make(chan struct{}),
+		unblock:   make(chan struct{}),
+	}
+}
+
+func (h *delayReplyHook) DialHook(next redis.DialHook) redis.DialHook {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return next(ctx, network, addr)
 	}
 }
 
-func (h *delayExtendReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (h *delayReplyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		err := next(ctx, cmd)
 		args := cmd.Args()
-		if len(args) > 1 && strings.EqualFold(fmt.Sprint(args[0]), "eval") &&
-			strings.Contains(fmt.Sprint(args[1]), "redis-kit:lock-extend") {
-			h.once.Do(func() {
+		matches := len(args) > 0 && strings.EqualFold(fmt.Sprint(args[0]), h.command)
+		if matches && h.scriptTag != "" {
+			matches = len(args) > 1 && strings.Contains(fmt.Sprint(args[1]), h.scriptTag)
+		}
+		if matches {
+			h.mu.Lock()
+			block := !h.claimed
+			h.claimed = true
+			h.mu.Unlock()
+			if block {
 				close(h.processed)
 				<-h.unblock
-			})
+			}
 		}
 		return err
 	}
 }
 
-func (h *delayExtendReplyHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (h *delayReplyHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		return next(ctx, cmds)
 	}
@@ -259,6 +276,108 @@ func TestHandleErrorsPreserveCallerCancellation(t *testing.T) {
 	}
 }
 
+// TestLockOperationsRejectRepliesAfterDeadline covers commands that Redis
+// accepted but whose replies were delayed for the whole conservative lease.
+// Reporting success at that point lets the caller enter a critical section
+// after the key may already have expired and been acquired elsewhere.
+func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
+	t.Run("Acquire", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewRedisLocker(client)
+		type result struct {
+			handle *Handle
+			err    error
+		}
+		done := make(chan result, 1)
+		go func() {
+			h, err := locker.Acquire(context.Background(), "late-acquire", 10*time.Millisecond)
+			done <- result{handle: h, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("Acquire did not reach the delayed-reply window")
+		}
+		time.Sleep(20 * time.Millisecond)
+		close(hook.unblock)
+		got := <-done
+		if got.handle != nil || !errors.Is(got.err, ErrLockExpired) {
+			t.Errorf("Acquire after its deadline = (%v, %v), want (nil, ErrLockExpired)", got.handle, got.err)
+		}
+	})
+
+	t.Run("Extend", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		locker := NewRedisLocker(client)
+		h, err := locker.Acquire(context.Background(), "late-extend", time.Minute)
+		if err != nil || h == nil {
+			t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+		}
+		previous := h.ExpiresAt()
+		hook := newDelayReplyHook("eval", "redis-kit:lock-extend")
+		client.AddHook(hook)
+		done := make(chan error, 1)
+		go func() { done <- h.Extend(context.Background(), 10*time.Millisecond) }()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("Extend did not reach the delayed-reply window")
+		}
+		time.Sleep(20 * time.Millisecond)
+		close(hook.unblock)
+		if err := <-done; !errors.Is(err, ErrLockExpired) {
+			t.Errorf("Extend after its deadline = %v, want ErrLockExpired", err)
+		}
+		if got := h.ExpiresAt(); !got.Equal(previous) {
+			t.Errorf("late Extend published deadline %s, want previous %s", got, previous)
+		}
+	})
+
+	t.Run("legacy Lock", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewRedisLockerWithLockTime(client, 10*time.Millisecond)
+		type result struct {
+			ok  bool
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("late-legacy")
+			done <- result{ok: ok, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("Lock did not reach the delayed-reply window")
+		}
+		time.Sleep(20 * time.Millisecond)
+		close(hook.unblock)
+		got := <-done
+		if got.ok || !errors.Is(got.err, ErrLockExpired) {
+			t.Errorf("Lock after its deadline = (%v, %v), want (false, ErrLockExpired)", got.ok, got.err)
+		}
+		if outstanding := locker.outstanding("late-legacy"); outstanding != 0 {
+			t.Errorf("late Lock recorded %d outstanding acquisition(s), want 0", outstanding)
+		}
+	})
+}
+
 // TestReleaseWaitsForInFlightExtend is the regression test for Release racing
 // a heartbeat. Redis can execute the extension and deletion in that order
 // while their replies complete in the opposite order; Release then returned
@@ -274,7 +393,7 @@ func TestReleaseWaitsForInFlightExtend(t *testing.T) {
 		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
 	}
 
-	hook := &delayExtendReplyHook{processed: make(chan struct{}), unblock: make(chan struct{})}
+	hook := newDelayReplyHook("eval", "redis-kit:lock-extend")
 	client.AddHook(hook)
 
 	extendDone := make(chan error, 1)

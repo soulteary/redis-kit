@@ -9,10 +9,11 @@ var (
 	ErrLockValueMismatch = errors.New("lock value mismatch or lock has expired")
 	// ErrLockValueType indicates the stored lock value has an unexpected type.
 	ErrLockValueType = errors.New("lock value type error")
-	// ErrLockExpired indicates this locker's lease elapsed before Unlock was
-	// called, so the lock may already be held by someone else. It is reported
-	// without touching Redis, precisely so a late Unlock cannot delete the key
-	// a different holder has since acquired.
+	// ErrLockExpired indicates this locker's conservative lease elapsed before
+	// an acquisition/extension reply arrived or before Unlock was called, so
+	// the lock may already be held by someone else. A late Unlock reports it
+	// without touching Redis, precisely so it cannot delete a later holder's
+	// key.
 	ErrLockExpired = errors.New("lock lease expired before release")
 	// ErrRedisUnavailable indicates a Redis operation failed. A HybridLocker
 	// returns it rather than silently degrading to a process-local lock, which

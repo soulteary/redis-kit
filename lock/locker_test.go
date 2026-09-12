@@ -666,6 +666,116 @@ func TestRedisHeldKeyIsNotGrantedLocally(t *testing.T) {
 	}
 }
 
+// TestFallbackRoutingIsSerializedPerKey is the regression test for holding a
+// single mutex across every Redis call in fallback mode. One slow key made all
+// unrelated keys queue behind its operation timeout, while the routing
+// invariant only requires decisions for the same key to be indivisible.
+func TestFallbackRoutingIsSerializedPerKey(t *testing.T) {
+	t.Run("different keys proceed independently", func(t *testing.T) {
+		client, _ := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewHybridLockerWithLocalFallback(client)
+		type result struct {
+			ok  bool
+			err error
+		}
+		firstDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("slow-key")
+			firstDone <- result{ok: ok, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("first key did not reach the delayed-reply window")
+		}
+
+		secondDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("independent-key")
+			secondDone <- result{ok: ok, err: err}
+		}()
+
+		var second result
+		blocked := false
+		select {
+		case second = <-secondDone:
+		case <-time.After(250 * time.Millisecond):
+			blocked = true
+		}
+		close(hook.unblock)
+		first := <-firstDone
+		if blocked {
+			second = <-secondDone
+			t.Fatal("an unrelated key was blocked by the first key's Redis reply")
+		}
+		if !first.ok || first.err != nil {
+			t.Errorf("first Lock = (%v, %v), want (true, nil)", first.ok, first.err)
+		}
+		if !second.ok || second.err != nil {
+			t.Errorf("second Lock = (%v, %v), want (true, nil)", second.ok, second.err)
+		}
+	})
+
+	t.Run("same key remains indivisible", func(t *testing.T) {
+		client, mock := testutil.NewMockRedisClient()
+		defer func() { _ = client.Close() }()
+
+		hook := newDelayReplyHook("set", "")
+		client.AddHook(hook)
+		locker := NewHybridLockerWithLocalFallback(client)
+		type result struct {
+			ok  bool
+			err error
+		}
+		firstDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("same-key")
+			firstDone <- result{ok: ok, err: err}
+		}()
+
+		select {
+		case <-hook.processed:
+		case <-time.After(2 * time.Second):
+			close(hook.unblock)
+			t.Fatal("first acquisition did not reach the delayed-reply window")
+		}
+		// Redis is lost after accepting the first lock but before its caller
+		// records the backend. A concurrent same-key decision must wait for that
+		// record rather than granting a local fallback.
+		mock.SetShouldFail(true)
+		secondDone := make(chan result, 1)
+		go func() {
+			ok, err := locker.Lock("same-key")
+			secondDone <- result{ok: ok, err: err}
+		}()
+
+		returnedEarly := false
+		select {
+		case <-secondDone:
+			returnedEarly = true
+		case <-time.After(100 * time.Millisecond):
+		}
+		close(hook.unblock)
+		first := <-firstDone
+		if returnedEarly {
+			t.Fatal("a same-key routing decision completed before the first was recorded")
+		}
+		second := <-secondDone
+		if !first.ok || first.err != nil {
+			t.Errorf("first Lock = (%v, %v), want (true, nil)", first.ok, first.err)
+		}
+		if second.ok || !errors.Is(second.err, ErrRedisUnavailable) {
+			t.Errorf("same-key Lock during outage = (%v, %v), want refusal with ErrRedisUnavailable", second.ok, second.err)
+		}
+	})
+}
+
 // TestLegacyQueueFollowsRedisOrder is the regression test for enqueueing
 // outside the SET. Apart, the queue is ordered by reply completion rather than
 // by Redis execution, so a delayed reply could file the LATER acquisition

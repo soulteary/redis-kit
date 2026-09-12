@@ -113,7 +113,7 @@ func generateLockValue() (string, error) {
 // Returns true if the lock was successfully acquired, false if the lock is already held
 func (r *RedisLocker) Lock(key string) (bool, error) {
 	if r.client == nil {
-		return false, fmt.Errorf("redis client is nil")
+		return false, fmt.Errorf("%w: redis client is nil", ErrRedisUnavailable)
 	}
 	if r.lockTime <= 0 {
 		return false, fmt.Errorf("lock time must be positive, got %s", r.lockTime)
@@ -136,15 +136,23 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 	release := r.operationMu.lock(key)
 	defer release()
 
-	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
+	issued := time.Now()
+	ttl := roundUpMillis(r.lockTime)
+	deadline := issued.Add(ttl)
+	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: ttl}).Result()
 	if err != nil && err != redis.Nil {
 		return false, fmt.Errorf("%w: failed to acquire lock: %w", ErrRedisUnavailable, err)
 	}
 	res := (err == nil)
 	if res {
+		// As with Handle.Acquire, a reply received after the conservative
+		// deadline must not let the caller begin work as a holder.
+		if !time.Now().Before(deadline) {
+			return false, ErrLockExpired
+		}
 		// Append rather than replace: a previous holder of this key may not
 		// have unlocked yet, and its Unlock must find ITS entry, not this one.
-		r.storeEntry(key, lockEntry{token: lockValue, expires: time.Now().Add(r.lockTime)})
+		r.storeEntry(key, lockEntry{token: lockValue, expires: deadline})
 	}
 
 	return res, nil
@@ -279,10 +287,13 @@ type HybridLocker struct {
 	localLocker        *LocalLocker
 	allowLocalFallback bool
 
-	// fallbackMu guards heldBy AND serialises the whole Lock/Unlock decision
-	// while the fallback is enabled, so a key cannot be acquired through both
-	// backends at once.
-	fallbackMu sync.Mutex
+	// fallbackMu serialises the complete backend-routing decision per key, so
+	// one key cannot be acquired through both backends while unrelated keys
+	// continue independently during a slow Redis outage.
+	fallbackMu keyedMutex
+	// heldMu protects held; it is held only for short map operations, never a
+	// Redis request.
+	heldMu sync.Mutex
 	// held counts this locker's outstanding acquisitions per key, by backend.
 	//
 	// A COUNT, not a single marker: the legacy queue lets one locker hold the
@@ -307,16 +318,20 @@ func (h *HybridLocker) fallbackActive() bool {
 	return h.redisLocker != nil && h.allowLocalFallback
 }
 
-// counts returns key's outstanding acquisitions. Callers hold fallbackMu.
+// counts returns key's outstanding acquisitions.
 func (h *HybridLocker) counts(key string) backendCounts {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
 	if c := h.held[key]; c != nil {
 		return *c
 	}
 	return backendCounts{}
 }
 
-// acquired records one more acquisition. Callers hold fallbackMu.
+// acquired records one more acquisition.
 func (h *HybridLocker) acquired(key string, redisBacked bool) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
 	if h.held == nil {
 		h.held = make(map[string]*backendCounts)
 	}
@@ -332,8 +347,10 @@ func (h *HybridLocker) acquired(key string, redisBacked bool) {
 	}
 }
 
-// released records one fewer. Callers hold fallbackMu.
+// released records one fewer acquisition.
 func (h *HybridLocker) released(key string, redisBacked bool) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
 	c := h.held[key]
 	if c == nil {
 		return
@@ -383,14 +400,14 @@ func NewHybridLockerWithLocalFallback(client *redis.Client) *HybridLocker {
 // process-local lock instead.
 func (h *HybridLocker) Lock(key string) (bool, error) {
 	if h.fallbackActive() {
-		// Held for the whole decision, Redis call included. A key already
+		// Held for this key's whole decision, Redis call included. A key already
 		// held through the local fallback must not be handed out again via
 		// Redis the moment Redis recovers: that puts two holders in the
 		// critical section, and the local holder's Unlock then goes on to
-		// consume the Redis holder's token. Serialising costs throughput in a
-		// mode that has already given up cross-instance exclusion.
-		h.fallbackMu.Lock()
-		defer h.fallbackMu.Unlock()
+		// consume the Redis holder's token. Unrelated keys use independent
+		// entries and do not queue behind this network call.
+		releaseDecision := h.fallbackMu.lock(key)
+		defer releaseDecision()
 
 		switch c := h.counts(key); {
 		case c.local > 0:
@@ -411,7 +428,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 				}
 				return success, nil
 			}
-			return false, fmt.Errorf("%w: %w", ErrRedisUnavailable, err)
+			return false, err
 
 		default:
 			success, err := h.redisLocker.Lock(key)
@@ -421,8 +438,13 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 				}
 				return success, nil
 			}
-			// Explicitly opted in: mutual exclusion across instances is now
-			// lost.
+			// Only an unavailable Redis activates the explicit fallback. A
+			// definitive error such as an acquisition reply arriving after its
+			// lease deadline must be reported, not converted into a local grant.
+			if !errors.Is(err, ErrRedisUnavailable) {
+				return false, err
+			}
+			// Explicitly opted in: mutual exclusion across instances is now lost.
 			success, err = h.localLocker.Lock(key)
 			if success && err == nil {
 				h.acquired(key, false)
@@ -436,7 +458,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 		if err == nil {
 			return success, nil
 		}
-		return false, fmt.Errorf("%w: %w", ErrRedisUnavailable, err)
+		return false, err
 	}
 
 	return h.localLocker.Lock(key)
@@ -451,8 +473,8 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 // whose release failed went on to release whatever was held locally.
 func (h *HybridLocker) Unlock(key string) error {
 	if h.fallbackActive() {
-		h.fallbackMu.Lock()
-		defer h.fallbackMu.Unlock()
+		releaseDecision := h.fallbackMu.lock(key)
+		defer releaseDecision()
 
 		switch c := h.counts(key); {
 		case c.local > 0:

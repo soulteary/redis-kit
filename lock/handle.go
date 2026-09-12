@@ -110,6 +110,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	// lease is really 1ms. Round UP and stamp the deadline from the rounded
 	// value, so ExpiresAt never claims ownership the server did not grant.
 	ttl = roundUpMillis(ttl)
+	deadline := issued.Add(ttl)
 
 	err = l.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Err()
 	if errors.Is(err, redis.Nil) {
@@ -118,8 +119,15 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	if err != nil {
 		return nil, fmt.Errorf("%w: acquire %q: %w", ErrRedisUnavailable, key, err)
 	}
+	// A successful Redis reply is not enough if it arrives after our
+	// conservative lease deadline. The key may already have expired and been
+	// acquired by somebody else before this caller can enter its critical
+	// section, so never hand out an already-expired Handle.
+	if !time.Now().Before(deadline) {
+		return nil, ErrLockExpired
+	}
 
-	return &Handle{client: l.client, key: key, token: token, expires: issued.Add(ttl)}, nil
+	return &Handle{client: l.client, key: key, token: token, expires: deadline}, nil
 }
 
 // Release gives the lock back.
@@ -179,6 +187,7 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// Same pre-command stamp as Acquire: Redis restarts the TTL when it runs
 	// PEXPIRE, so measuring from the reply overstates the new lease.
 	issued := time.Now()
+	deadline := issued.Add(ttl)
 
 	res, err := h.client.Eval(ctx, extendScript, []string{h.key}, h.token, ttl.Milliseconds()).Result()
 	if err != nil {
@@ -187,9 +196,15 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	if n, ok := res.(int64); !ok || n == 0 {
 		return ErrLockExpired
 	}
+	// Do not publish a successful renewal after the entire conservative lease
+	// has elapsed while its reply was in flight. The key can already be free
+	// or held by another caller at this point.
+	if !time.Now().Before(deadline) {
+		return ErrLockExpired
+	}
 
 	h.mu.Lock()
-	h.expires = issued.Add(ttl)
+	h.expires = deadline
 	h.mu.Unlock()
 	return nil
 }
