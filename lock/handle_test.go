@@ -218,15 +218,21 @@ func TestLockStoreDoesNotGrowUnbounded(t *testing.T) {
 		t.Errorf("lockStore tracks %d keys after balanced use, want 0", got)
 	}
 
-	// Acquiring without releasing is capped rather than unbounded.
-	stale := NewRedisLockerWithLockTime(client, time.Nanosecond)
+	// Populate the queue directly: Redis leases have millisecond granularity,
+	// so repeatedly reacquiring a nanosecond lease makes this memory-bound test
+	// depend on runner speed rather than the queue logic it is meant to cover.
 	for i := 0; i < maxOutstandingPerKey+50; i++ {
-		if _, err := stale.Lock("leaky"); err != nil {
-			t.Fatalf("Lock() error = %v", err)
-		}
+		l.storeEntry("leaky", lockEntry{token: fmt.Sprintf("token-%d", i), expires: time.Now().Add(time.Hour)})
 	}
-	if got := stale.outstanding("leaky"); got > maxOutstandingPerKey {
-		t.Errorf("lockStore holds %d entries for one key, want at most %d", got, maxOutstandingPerKey)
+	l.mu.Lock()
+	q := l.lockStore["leaky"]
+	entries, tombstones := len(q.entries), q.tombstones
+	l.mu.Unlock()
+	if entries != maxOutstandingPerKey {
+		t.Errorf("lockStore holds %d queue entries for one key, want %d", entries, maxOutstandingPerKey)
+	}
+	if got, want := entries+tombstones, maxOutstandingPerKey+50; got != want {
+		t.Errorf("accounted acquisitions = %d, want %d", got, want)
 	}
 }
 
