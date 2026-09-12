@@ -234,6 +234,11 @@ redis-kit/
 └── testutil/        # 测试工具（Mock Redis）
 ```
 
+## 环境要求
+
+- **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
+- Redis 服务器（测试时可选，提供 Mock Redis）
+
 ## 测试覆盖率
 
 运行测试并查看覆盖率：
@@ -252,12 +257,9 @@ go tool cover -html=coverage.out -o coverage.html
 go tool cover -func=coverage.out
 ```
 
-## 环境要求
+## 示例
 
-- **Go 1.27+**（`go.mod` 声明 `go 1.27.0`）
-- Redis 服务器（测试时可选，提供 Mock Redis）
-
-## 完整示例：带限流的缓存与锁
+### 完整示例：带限流的缓存与锁
 
 ```go
 package main
