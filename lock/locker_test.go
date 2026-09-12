@@ -666,6 +666,42 @@ func TestRedisHeldKeyIsNotGrantedLocally(t *testing.T) {
 	}
 }
 
+// TestFallbackForgetsRedisCountsAfterTheirLeaseBound covers an abandoned
+// Redis-backed Hybrid acquisition. Its Redis TTL eventually makes overlap
+// impossible, so the bookkeeping count must not disable explicit local
+// fallback forever when Redis is later unavailable.
+func TestFallbackForgetsRedisCountsAfterTheirLeaseBound(t *testing.T) {
+	client, mock := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+	h := NewHybridLockerWithLocalFallback(client)
+
+	if ok, err := h.Lock("abandoned"); err != nil || !ok {
+		t.Fatalf("initial Redis Lock = (%v, %v), want (true, nil)", ok, err)
+	}
+	h.heldMu.Lock()
+	state := h.held["abandoned"]
+	if state == nil || state.redis != 1 || state.redisUntil.IsZero() {
+		h.heldMu.Unlock()
+		t.Fatalf("recorded Redis state = %#v, want one acquisition with an expiry bound", state)
+	}
+	// Deterministically model that bound passing. Delete the mock Redis key as
+	// well, so the state agrees with the server-side lease having expired.
+	state.redisUntil = time.Now().Add(-time.Second)
+	h.heldMu.Unlock()
+	if err := client.Del(context.Background(), "abandoned").Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.SetShouldFail(true)
+	defer mock.SetShouldFail(false)
+	if ok, err := h.Lock("abandoned"); err != nil || !ok {
+		t.Fatalf("Lock after Redis lease bound = (%v, %v), want local fallback", ok, err)
+	}
+	if err := h.Unlock("abandoned"); err != nil {
+		t.Errorf("local fallback Unlock = %v", err)
+	}
+}
+
 // TestFallbackRoutingIsSerializedPerKey is the regression test for holding a
 // single mutex across every Redis call in fallback mode. One slow key made all
 // unrelated keys queue behind its operation timeout, while the routing

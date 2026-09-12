@@ -236,6 +236,47 @@ func TestLockStoreDoesNotGrowUnbounded(t *testing.T) {
 	}
 }
 
+// TestLockStorePrunesExpiredDistinctKeys covers unbalanced legacy users with
+// high-cardinality keys. Fully expired queues have no live token left to
+// protect and are pruned when another key is recorded; a queue with a later
+// live acquisition retains its expired prefix for FIFO Unlock safety.
+func TestLockStorePrunesExpiredDistinctKeys(t *testing.T) {
+	l := NewRedisLocker(nil)
+	now := time.Now()
+	for i := 0; i < 100; i++ {
+		l.storeEntry(fmt.Sprintf("expired-%d", i), lockEntry{
+			token:   fmt.Sprintf("token-%d", i),
+			expires: now.Add(-time.Second),
+		})
+	}
+	l.storeEntry("live", lockEntry{token: "live", expires: now.Add(time.Hour)})
+
+	l.mu.Lock()
+	if got := len(l.lockStore); got != 1 {
+		l.mu.Unlock()
+		t.Fatalf("tracked key queues = %d, want only the live queue", got)
+	}
+	if _, ok := l.lockStore["live"]; !ok {
+		l.mu.Unlock()
+		t.Fatal("live queue was pruned")
+	}
+	l.mu.Unlock()
+
+	l.storeEntry("protected", lockEntry{token: "old", expires: now.Add(-time.Second)})
+	l.storeEntry("protected", lockEntry{token: "new", expires: now.Add(time.Hour)})
+	l.storeEntry("trigger", lockEntry{token: "trigger", expires: now.Add(time.Hour)})
+	l.mu.Lock()
+	protected := l.lockStore["protected"]
+	entries := 0
+	if protected != nil {
+		entries = len(protected.entries)
+	}
+	l.mu.Unlock()
+	if entries != 2 {
+		t.Errorf("protected queue entries = %d, want expired prefix plus live acquisition", entries)
+	}
+}
+
 func TestAcquireNilClient(t *testing.T) {
 	l := &RedisLocker{}
 	h, err := l.Acquire(context.Background(), "k", time.Minute)

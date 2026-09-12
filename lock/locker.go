@@ -83,7 +83,8 @@ type lockEntry struct {
 // A balanced Lock/Unlock pair leaves an empty queue and the key is dropped, so
 // this only matters for a process that acquires and never releases (a panic,
 // an early return). Past the cap the oldest entry is discarded to bound
-// memory; a straggler Unlock for it then reports ErrLockNotHeld.
+// memory; tombstones preserve Unlock ordering while a later live entry still
+// needs protection.
 const maxOutstandingPerKey = 1024
 
 // NewRedisLocker creates a new Redis-based distributed locker
@@ -162,6 +163,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 func (r *RedisLocker) takeOldest(key string) (lockEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.pruneExpiredQueuesLocked(key, time.Now())
 
 	q := r.lockStore[key]
 	if q == nil {
@@ -305,11 +307,13 @@ type HybridLocker struct {
 }
 
 // backendCounts is how many acquisitions of one key are outstanding on each
-// backend, plus the upper bound for a late Redis acquisition whose cleanup
-// failed. At most one backend count is non-zero: Lock refuses to mix them.
+// backend, the conservative expiry bound for normal Redis acquisitions, and
+// the bound for a late Redis acquisition whose cleanup failed. At most one
+// backend count is non-zero: Lock refuses to mix them while either can live.
 type backendCounts struct {
 	redis          int
 	local          int
+	redisUntil     time.Time
 	uncertainUntil time.Time
 }
 
@@ -325,12 +329,21 @@ func (h *HybridLocker) counts(key string) backendCounts {
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
 	if c := h.held[key]; c != nil {
-		if !c.uncertainUntil.IsZero() && !time.Now().Before(c.uncertainUntil) {
+		now := time.Now()
+		// A Redis count protects against local fallback only while at least one
+		// corresponding server lease can still exist. redisUntil is a
+		// conservative upper bound taken from the successful reply plus the full
+		// rounded TTL.
+		if c.redis > 0 && !c.redisUntil.IsZero() && !now.Before(c.redisUntil) {
+			c.redis = 0
+			c.redisUntil = time.Time{}
+		}
+		if !c.uncertainUntil.IsZero() && !now.Before(c.uncertainUntil) {
 			c.uncertainUntil = time.Time{}
-			if c.redis <= 0 && c.local <= 0 {
-				delete(h.held, key)
-				return backendCounts{}
-			}
+		}
+		if c.redis <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
+			delete(h.held, key)
+			return backendCounts{}
 		}
 		return *c
 	}
@@ -338,7 +351,7 @@ func (h *HybridLocker) counts(key string) backendCounts {
 }
 
 // acquired records one more acquisition.
-func (h *HybridLocker) acquired(key string, redisBacked bool) {
+func (h *HybridLocker) acquired(key string, redisBacked bool, redisUntil time.Time) {
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
 	if h.held == nil {
@@ -351,6 +364,9 @@ func (h *HybridLocker) acquired(key string, redisBacked bool) {
 	}
 	if redisBacked {
 		c.redis++
+		if redisUntil.After(c.redisUntil) {
+			c.redisUntil = redisUntil
+		}
 	} else {
 		c.local++
 	}
@@ -365,9 +381,16 @@ func (h *HybridLocker) released(key string, redisBacked bool) {
 		return
 	}
 	if redisBacked {
-		c.redis--
+		if c.redis > 0 {
+			c.redis--
+		}
+		if c.redis == 0 {
+			c.redisUntil = time.Time{}
+		}
 	} else {
-		c.local--
+		if c.local > 0 {
+			c.local--
+		}
 	}
 	if c.redis <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
 		delete(h.held, key)
@@ -451,7 +474,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			success, err := h.redisLocker.Lock(key)
 			if err == nil {
 				if success {
-					h.acquired(key, true)
+					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
 				}
 				return success, nil
 			}
@@ -468,7 +491,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			success, err := h.redisLocker.Lock(key)
 			if err == nil {
 				if success {
-					h.acquired(key, true)
+					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
 				}
 				return success, nil
 			}
@@ -491,7 +514,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			// Explicitly opted in: mutual exclusion across instances is now lost.
 			success, err = h.localLocker.Lock(key)
 			if success && err == nil {
-				h.acquired(key, false)
+				h.acquired(key, false, time.Time{})
 			}
 			return success, err
 		}
@@ -562,6 +585,7 @@ func (h *HybridLocker) Unlock(key string) error {
 func (r *RedisLocker) restoreOldest(key string, entry lockEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.pruneExpiredQueuesLocked(key, time.Now())
 
 	q := r.lockStore[key]
 	if q == nil {
@@ -581,6 +605,10 @@ func (r *RedisLocker) restoreOldest(key string, entry lockEntry) {
 func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Opportunistically remove abandoned queues for other keys. The current
+	// key is deliberately preserved: appending a later acquisition means its
+	// expired predecessors (or tombstones) still protect FIFO Unlock routing.
+	r.pruneExpiredQueuesLocked(key, time.Now())
 
 	q := r.lockStore[key]
 	if q == nil {
@@ -594,6 +622,33 @@ func (r *RedisLocker) storeEntry(key string, entry lockEntry) {
 		// later callers onto somebody else's acquisition.
 		q.entries = q.entries[over:]
 		q.tombstones += over
+	}
+}
+
+// pruneExpiredQueuesLocked removes queues that contain no lease which could
+// still exist. A queue with any live later acquisition is retained wholesale:
+// its expired prefix and tombstones keep a late Unlock from reaching that live
+// token. preserveKey is an acquisition currently being appended or consumed
+// and must not be pruned between those operations. Callers hold r.mu.
+func (r *RedisLocker) pruneExpiredQueuesLocked(preserveKey string, now time.Time) {
+	for key, q := range r.lockStore {
+		if key == preserveKey {
+			continue
+		}
+		if q == nil {
+			delete(r.lockStore, key)
+			continue
+		}
+		fullyExpired := true
+		for _, entry := range q.entries {
+			if now.Before(entry.expires) {
+				fullyExpired = false
+				break
+			}
+		}
+		if fullyExpired {
+			delete(r.lockStore, key)
+		}
 	}
 }
 
