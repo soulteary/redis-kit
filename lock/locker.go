@@ -133,7 +133,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 
 	_, err = r.client.SetArgs(ctx, key, lockValue, redis.SetArgs{Mode: "NX", TTL: r.lockTime}).Result()
 	if err != nil && err != redis.Nil {
-		return false, fmt.Errorf("failed to acquire lock: %w", err)
+		return false, fmt.Errorf("%w: failed to acquire lock: %v", ErrRedisUnavailable, err)
 	}
 	res := (err == nil)
 	if res {
@@ -223,7 +223,14 @@ func (r *RedisLocker) Unlock(key string) error {
 	`
 	result, err := r.client.Eval(ctx, script, []string{key}, lockValue).Result()
 	if err != nil {
-		return fmt.Errorf("failed to release lock: %w", err)
+		// Classified, not just wrapped. A transport failure is NOT a verdict
+		// about the lock -- the lease may still be held -- and callers have to
+		// be able to tell it apart from ErrLockExpired or a value mismatch.
+		// HybridLocker's own guard tested for ErrRedisUnavailable here and
+		// never saw it, so it treated every outage as definitive and dropped
+		// the record that stops a local fallback being granted for a key
+		// Redis may still hold.
+		return fmt.Errorf("%w: failed to release lock: %v", ErrRedisUnavailable, err)
 	}
 
 	// Check if lock was actually released
@@ -253,19 +260,22 @@ type HybridLocker struct {
 	// while the fallback is enabled, so a key cannot be acquired through both
 	// backends at once.
 	fallbackMu sync.Mutex
-	// heldBy records which backend holds each key this locker has acquired
-	// and not yet released.
-	heldBy map[string]lockBackend
+	// held counts this locker's outstanding acquisitions per key, by backend.
+	//
+	// A COUNT, not a single marker: the legacy queue lets one locker hold the
+	// same key more than once -- reacquiring after a lease elapses -- and a
+	// key-level marker was cleared by the first definitive unlock. The newer
+	// Redis lock was still live, so a local fallback could then be granted
+	// alongside it.
+	held map[string]*backendCounts
 }
 
-// lockBackend identifies which locker an acquisition came from.
-type lockBackend int
-
-const (
-	backendNone lockBackend = iota
-	backendRedis
-	backendLocal
-)
+// backendCounts is how many acquisitions of one key are outstanding on each
+// backend. At most one of the two is ever non-zero: Lock refuses to mix them.
+type backendCounts struct {
+	redis int
+	local int
+}
 
 // fallbackActive reports whether this locker can hold a key through the local
 // lock while also talking to Redis -- the only configuration in which an
@@ -274,12 +284,45 @@ func (h *HybridLocker) fallbackActive() bool {
 	return h.redisLocker != nil && h.allowLocalFallback
 }
 
-// record notes which backend holds key. Callers hold fallbackMu.
-func (h *HybridLocker) record(key string, backend lockBackend) {
-	if h.heldBy == nil {
-		h.heldBy = make(map[string]lockBackend)
+// counts returns key's outstanding acquisitions. Callers hold fallbackMu.
+func (h *HybridLocker) counts(key string) backendCounts {
+	if c := h.held[key]; c != nil {
+		return *c
 	}
-	h.heldBy[key] = backend
+	return backendCounts{}
+}
+
+// acquired records one more acquisition. Callers hold fallbackMu.
+func (h *HybridLocker) acquired(key string, redisBacked bool) {
+	if h.held == nil {
+		h.held = make(map[string]*backendCounts)
+	}
+	c := h.held[key]
+	if c == nil {
+		c = &backendCounts{}
+		h.held[key] = c
+	}
+	if redisBacked {
+		c.redis++
+	} else {
+		c.local++
+	}
+}
+
+// released records one fewer. Callers hold fallbackMu.
+func (h *HybridLocker) released(key string, redisBacked bool) {
+	c := h.held[key]
+	if c == nil {
+		return
+	}
+	if redisBacked {
+		c.redis--
+	} else {
+		c.local--
+	}
+	if c.redis <= 0 && c.local <= 0 {
+		delete(h.held, key)
+	}
 }
 
 // NewHybridLocker creates a hybrid locker that uses Redis when client is
@@ -326,20 +369,23 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 		h.fallbackMu.Lock()
 		defer h.fallbackMu.Unlock()
 
-		switch h.heldBy[key] {
-		case backendLocal:
+		switch c := h.counts(key); {
+		case c.local > 0:
 			// A local fallback is outstanding. Do not hand the key out
 			// through Redis: that is a second holder in the same critical
 			// section. The local locker refuses it, which is the answer.
 			return h.localLocker.Lock(key)
 
-		case backendRedis:
+		case c.redis > 0:
 			// A Redis acquisition is outstanding. Never degrade to the local
-			// lock for THIS key, even now that Redis is unreachable -- the
-			// Redis holder is still running. Refusing costs availability for
-			// one key; degrading would put two callers inside it.
+			// lock for THIS key, even now that Redis is unreachable -- that
+			// holder is still running. Refusing costs availability for one
+			// key; degrading would put two callers inside it.
 			success, err := h.redisLocker.Lock(key)
 			if err == nil {
+				if success {
+					h.acquired(key, true)
+				}
 				return success, nil
 			}
 			return false, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
@@ -348,7 +394,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			success, err := h.redisLocker.Lock(key)
 			if err == nil {
 				if success {
-					h.record(key, backendRedis)
+					h.acquired(key, true)
 				}
 				return success, nil
 			}
@@ -356,7 +402,7 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			// lost.
 			success, err = h.localLocker.Lock(key)
 			if success && err == nil {
-				h.record(key, backendLocal)
+				h.acquired(key, false)
 			}
 			return success, err
 		}
@@ -385,19 +431,21 @@ func (h *HybridLocker) Unlock(key string) error {
 		h.fallbackMu.Lock()
 		defer h.fallbackMu.Unlock()
 
-		switch h.heldBy[key] {
-		case backendLocal:
-			delete(h.heldBy, key)
+		switch c := h.counts(key); {
+		case c.local > 0:
+			h.released(key, false)
 			return h.localLocker.Unlock(key)
 
-		case backendRedis:
+		case c.redis > 0:
 			err := h.redisLocker.Unlock(key)
-			// Forget the key once the answer is definitive -- released, or
-			// no longer ours. An unreachable Redis is NOT definitive: the
-			// lease may still be held there, so the record stays and no
-			// local fallback is granted for it.
+			// Drop ONE acquisition once the answer is definitive -- released,
+			// or no longer ours. An unreachable Redis is not definitive: the
+			// lease may still be held there, so the count stays and no local
+			// fallback is granted for the key. RedisLocker.Unlock classifies
+			// transport failures as ErrRedisUnavailable, which is what makes
+			// this test mean anything.
 			if err == nil || !errors.Is(err, ErrRedisUnavailable) {
-				delete(h.heldBy, key)
+				h.released(key, true)
 			}
 			return err
 
