@@ -788,7 +788,7 @@ func TestFallbackPreservesLateLeaseCleanupFailure(t *testing.T) {
 	hook.after = func() { mock.SetShouldFail(true) }
 	client.AddHook(hook)
 	locker := NewHybridLockerWithLocalFallback(client)
-	locker.redisLocker.lockTime = 100 * time.Millisecond
+	locker.redisLocker.lockTime = 500 * time.Millisecond
 
 	type result struct {
 		ok  bool
@@ -806,16 +806,25 @@ func TestFallbackPreservesLateLeaseCleanupFailure(t *testing.T) {
 		close(hook.unblock)
 		t.Fatal("Lock did not reach the queued-command window")
 	}
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(520 * time.Millisecond)
 	close(hook.unblock)
 	got := <-done
 	if got.ok || !errors.Is(got.err, ErrLockExpired) || !errors.Is(got.err, ErrRedisUnavailable) {
 		t.Errorf("Hybrid Lock after failed late cleanup = (%v, %v), want false and both sentinels", got.ok, got.err)
 	}
 
-	// A hidden fallback would already occupy the local key.
-	if ok, err := locker.localLocker.Lock("late-cleanup"); err != nil || !ok {
-		t.Errorf("local key was occupied after rejected fallback: (%v, %v)", ok, err)
+	// The next call sees the uncertain Redis-backed marker and cannot turn the
+	// same outage into a local grant.
+	if ok, err := locker.Lock("late-cleanup"); ok || !errors.Is(err, ErrRedisUnavailable) {
+		t.Errorf("retry during the uncertain lease = (%v, %v), want refusal", ok, err)
+	}
+
+	// Redis executed SET before the first error was returned, so one TTL from
+	// that reply is a safe upper bound. Once it passes, fallback is available
+	// again rather than leaving an unbounded tombstone.
+	time.Sleep(520 * time.Millisecond)
+	if ok, err := locker.Lock("late-cleanup"); err != nil || !ok {
+		t.Errorf("retry after the uncertainty deadline = (%v, %v), want local fallback", ok, err)
 	}
 }
 

@@ -20,15 +20,35 @@ else
 end
 `
 
+// uncertainLeaseError carries the safe upper bound for a Redis lease whose
+// token cleanup failed.
+type uncertainLeaseError struct {
+	key   string
+	until time.Time
+	cause error
+}
+
+func (e *uncertainLeaseError) Error() string {
+	return fmt.Sprintf("%s: cleanup rejected lease %q: %s: %v", ErrLockExpired, e.key, ErrRedisUnavailable, e.cause)
+}
+
+func (e *uncertainLeaseError) Unwrap() []error {
+	return []error{ErrLockExpired, ErrRedisUnavailable, e.cause}
+}
+
 // rejectLateLease removes a lock whose successful reply arrived after the
 // caller's conservative deadline. The command may have waited in the client
 // pool and only just executed, so Redis can still hold the token for its full
 // TTL even though it is no longer safe to hand ownership to the caller.
-func rejectLateLease(ctx context.Context, client *redis.Client, key, token string) error {
+func rejectLateLease(ctx context.Context, client *redis.Client, key, token string, ttl time.Duration) error {
+	// Redis executed before delivering the successful reply, so one full TTL
+	// from this observation is a conservative upper bound even when the
+	// command spent most of its time queued before execution.
+	until := time.Now().Add(ttl)
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultOperationTimeout)
 	defer cancel()
 	if _, err := client.Eval(cleanupCtx, releaseScript, []string{key}, token).Result(); err != nil {
-		return fmt.Errorf("%w: cleanup rejected lease %q: %w: %w", ErrLockExpired, key, ErrRedisUnavailable, err)
+		return &uncertainLeaseError{key: key, until: until, cause: err}
 	}
 	return ErrLockExpired
 }
@@ -137,7 +157,7 @@ func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration
 	// acquired by somebody else before this caller can enter its critical
 	// section, so never hand out an already-expired Handle.
 	if !time.Now().Before(deadline) {
-		return nil, rejectLateLease(ctx, l.client, key, token)
+		return nil, rejectLateLease(ctx, l.client, key, token, ttl)
 	}
 
 	return &Handle{client: l.client, key: key, token: token, expires: deadline}, nil
@@ -213,7 +233,7 @@ func (h *Handle) Extend(ctx context.Context, ttl time.Duration) error {
 	// has elapsed while its reply was in flight. The key can already be free
 	// or held by another caller at this point.
 	if !time.Now().Before(deadline) {
-		return rejectLateLease(ctx, h.client, h.key, h.token)
+		return rejectLateLease(ctx, h.client, h.key, h.token, ttl)
 	}
 
 	h.mu.Lock()

@@ -148,7 +148,7 @@ func (r *RedisLocker) Lock(key string) (bool, error) {
 		// As with Handle.Acquire, a reply received after the conservative
 		// deadline must not let the caller begin work as a holder.
 		if !time.Now().Before(deadline) {
-			return false, rejectLateLease(ctx, r.client, key, lockValue)
+			return false, rejectLateLease(ctx, r.client, key, lockValue, ttl)
 		}
 		// Append rather than replace: a previous holder of this key may not
 		// have unlocked yet, and its Unlock must find ITS entry, not this one.
@@ -305,10 +305,12 @@ type HybridLocker struct {
 }
 
 // backendCounts is how many acquisitions of one key are outstanding on each
-// backend. At most one of the two is ever non-zero: Lock refuses to mix them.
+// backend, plus the upper bound for a late Redis acquisition whose cleanup
+// failed. At most one backend count is non-zero: Lock refuses to mix them.
 type backendCounts struct {
-	redis int
-	local int
+	redis         int
+	local         int
+	uncertainUntil time.Time
 }
 
 // fallbackActive reports whether this locker can hold a key through the local
@@ -323,6 +325,13 @@ func (h *HybridLocker) counts(key string) backendCounts {
 	h.heldMu.Lock()
 	defer h.heldMu.Unlock()
 	if c := h.held[key]; c != nil {
+		if !c.uncertainUntil.IsZero() && !time.Now().Before(c.uncertainUntil) {
+			c.uncertainUntil = time.Time{}
+			if c.redis <= 0 && c.local <= 0 {
+				delete(h.held, key)
+				return backendCounts{}
+			}
+		}
 		return *c
 	}
 	return backendCounts{}
@@ -360,8 +369,26 @@ func (h *HybridLocker) released(key string, redisBacked bool) {
 	} else {
 		c.local--
 	}
-	if c.redis <= 0 && c.local <= 0 {
+	if c.redis <= 0 && c.local <= 0 && c.uncertainUntil.IsZero() {
 		delete(h.held, key)
+	}
+}
+
+// markUncertain prevents a local fallback while a late successful Redis SET
+// may still exist and its compare-and-delete cleanup had no verdict.
+func (h *HybridLocker) markUncertain(key string, until time.Time) {
+	h.heldMu.Lock()
+	defer h.heldMu.Unlock()
+	if h.held == nil {
+		h.held = make(map[string]*backendCounts)
+	}
+	c := h.held[key]
+	if c == nil {
+		c = &backendCounts{}
+		h.held[key] = c
+	}
+	if until.After(c.uncertainUntil) {
+		c.uncertainUntil = until
 	}
 }
 
@@ -428,7 +455,14 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 				}
 				return success, nil
 			}
+			var uncertain *uncertainLeaseError
+			if errors.As(err, &uncertain) {
+				h.markUncertain(key, uncertain.until)
+			}
 			return false, err
+
+		case !c.uncertainUntil.IsZero():
+			return false, fmt.Errorf("%w: Redis ownership of %q remains uncertain until %s", ErrRedisUnavailable, key, c.uncertainUntil)
 
 		default:
 			success, err := h.redisLocker.Lock(key)
@@ -444,7 +478,14 @@ func (h *HybridLocker) Lock(key string) (bool, error) {
 			// Test expiration first: failed cleanup of a late lease deliberately
 			// matches BOTH sentinels, and its uncertain Redis lock makes local
 			// fallback especially unsafe.
-			if errors.Is(err, ErrLockExpired) || !errors.Is(err, ErrRedisUnavailable) {
+			if errors.Is(err, ErrLockExpired) {
+				var uncertain *uncertainLeaseError
+				if errors.As(err, &uncertain) {
+					h.markUncertain(key, uncertain.until)
+				}
+				return false, err
+			}
+			if !errors.Is(err, ErrRedisUnavailable) {
 				return false, err
 			}
 			// Explicitly opted in: mutual exclusion across instances is now lost.
