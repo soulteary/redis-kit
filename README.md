@@ -421,7 +421,7 @@ func main() {
 Release-by-release detail, with the measured numbers behind each claim, lives
 in [CHANGELOG.md](CHANGELOG.md).
 
-## Upgrade Notes (unreleased)
+## Upgrade Notes (v1.7.0)
 
 **Client parameters are now `redis.UniversalClient` instead of
 `*redis.Client`.** Existing code keeps compiling — `*redis.Client` satisfies
