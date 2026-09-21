@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
 // ErrKeyNotFound is returned by Get when the key is absent or has expired.
@@ -32,12 +34,18 @@ func (e notFoundError) Is(target error) bool {
 
 // RedisCache provides a Redis-based cache implementation
 type RedisCache struct {
-	client    *redis.Client
+	client    redis.UniversalClient
 	keyPrefix string
 }
 
-// NewCache creates a new Redis cache with the given client and key prefix
-func NewCache(client *redis.Client, keyPrefix string) *RedisCache {
+// NewCache creates a new Redis cache with the given client and key prefix.
+//
+// client is a redis.UniversalClient, so *redis.Client, *redis.ClusterClient,
+// *redis.Ring and a Sentinel-backed failover client from
+// redis.NewFailoverClient all work here -- a cluster no longer needs a cache
+// of its own. A nil client is reported as "redis client is nil" by every
+// method, including a typed nil such as an unassigned *redis.Client field.
+func NewCache(client redis.UniversalClient, keyPrefix string) *RedisCache {
 	return &RedisCache{
 		client:    client,
 		keyPrefix: keyPrefix,
@@ -54,7 +62,7 @@ func (c *RedisCache) buildKey(key string) string {
 
 // Set stores a value in Redis with the given TTL
 func (c *RedisCache) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return fmt.Errorf("redis client is nil")
 	}
 
@@ -76,7 +84,7 @@ func (c *RedisCache) Set(ctx context.Context, key string, value interface{}, ttl
 
 // Get retrieves a value from Redis
 func (c *RedisCache) Get(ctx context.Context, key string, dest interface{}) error {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return fmt.Errorf("redis client is nil")
 	}
 
@@ -101,7 +109,7 @@ func (c *RedisCache) Get(ctx context.Context, key string, dest interface{}) erro
 
 // Del deletes a key from Redis
 func (c *RedisCache) Del(ctx context.Context, key string) error {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return fmt.Errorf("redis client is nil")
 	}
 
@@ -111,7 +119,7 @@ func (c *RedisCache) Del(ctx context.Context, key string) error {
 
 // Exists checks if a key exists in Redis
 func (c *RedisCache) Exists(ctx context.Context, key string) (bool, error) {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return false, fmt.Errorf("redis client is nil")
 	}
 
@@ -126,7 +134,7 @@ func (c *RedisCache) Exists(ctx context.Context, key string) (bool, error) {
 
 // TTL returns the remaining time-to-live of a key
 func (c *RedisCache) TTL(ctx context.Context, key string) (time.Duration, error) {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return 0, fmt.Errorf("redis client is nil")
 	}
 
@@ -141,7 +149,7 @@ func (c *RedisCache) TTL(ctx context.Context, key string) (time.Duration, error)
 
 // Expire sets the expiration time for a key
 func (c *RedisCache) Expire(ctx context.Context, key string, ttl time.Duration) error {
-	if c.client == nil {
+	if nilcheck.IsNil(c.client) {
 		return fmt.Errorf("redis client is nil")
 	}
 
