@@ -10,6 +10,8 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-09-21
+
 ### Changed
 
 - **Every client parameter is now a `redis.UniversalClient` instead of a
@@ -41,9 +43,9 @@ change the module path. It has not happened yet: the module path is still
 
   Measured for a program importing `cache`, `client`, `lock` and `ratelimit`
   and passing a `*redis.Client`, built `-trimpath` against v1.6.0 and against
-  this revision:
+  v1.7.0:
 
-  | | v1.6.0 | this revision |
+  | | v1.6.0 | v1.7.0 |
   |---|---|---|
   | binary | 10,631,474 B | 10,657,708 B (+26,234, +0.25%) |
   | linked packages | 202 | 203 (`internal/nilcheck`) |

@@ -412,7 +412,7 @@ func main() {
 逐版本的详细说明，以及每条结论背后的实测数字，见
 [CHANGELOG.md](CHANGELOG.md)。
 
-## 升级说明（未发布）
+## 升级说明（v1.7.0）
 
 **客户端参数从 `*redis.Client` 改为 `redis.UniversalClient`。** 现有代码不需要
 改动 —— `*redis.Client` 满足该接口，之前能编译的调用现在照样能编译，import 也
