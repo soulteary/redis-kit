@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
 const (
@@ -22,7 +24,7 @@ const (
 
 // RedisLocker provides Redis-based distributed lock functionality
 type RedisLocker struct {
-	client   *redis.Client
+	client   redis.UniversalClient
 	lockTime time.Duration
 
 	// mu guards lockStore.
@@ -95,13 +97,23 @@ const maxOutstandingPerKey = 1024
 // token in the returned Handle and does not use this map.
 const maxTrackedLegacyKeys = 1024
 
-// NewRedisLocker creates a new Redis-based distributed locker
-func NewRedisLocker(client *redis.Client) *RedisLocker {
+// NewRedisLocker creates a new Redis-based distributed locker.
+//
+// client is a redis.UniversalClient, so *redis.Client, *redis.ClusterClient,
+// *redis.Ring and a Sentinel-backed failover client all work here.
+//
+// Every command this locker issues names exactly one key, so nothing here is
+// cross-slot on a cluster. Note what a cluster does NOT give you: a lock lives
+// on one node, and its replica is asynchronous, so a failover can lose an
+// acquisition that was already acknowledged. That is a property of the
+// deployment, not of this locker -- a single-master lock is only as safe as
+// the failover behind it.
+func NewRedisLocker(client redis.UniversalClient) *RedisLocker {
 	return NewRedisLockerWithLockTime(client, DefaultLockTime)
 }
 
 // NewRedisLockerWithLockTime creates a new Redis-based distributed locker with custom lock time
-func NewRedisLockerWithLockTime(client *redis.Client, lockTime time.Duration) *RedisLocker {
+func NewRedisLockerWithLockTime(client redis.UniversalClient, lockTime time.Duration) *RedisLocker {
 	return &RedisLocker{
 		client:    client,
 		lockTime:  lockTime,
@@ -121,7 +133,7 @@ func generateLockValue() (string, error) {
 // Lock acquires a distributed lock using Redis SET key value NX
 // Returns true if the lock was successfully acquired, false if the lock is already held
 func (r *RedisLocker) Lock(key string) (bool, error) {
-	if r.client == nil {
+	if nilcheck.IsNil(r.client) {
 		return false, fmt.Errorf("redis client is nil")
 	}
 	if r.lockTime <= 0 {
@@ -255,7 +267,7 @@ func (r *RedisLocker) dropEmptyQueue(key string) {
 // caller comes to delete a current holder's lock. Acquire returns a Handle
 // carrying its own token and has neither problem.
 func (r *RedisLocker) Unlock(key string) error {
-	if r.client == nil {
+	if nilcheck.IsNil(r.client) {
 		return fmt.Errorf("redis client is nil")
 	}
 
@@ -496,12 +508,17 @@ func (h *HybridLocker) markUncertain(key string, until time.Time) {
 //
 // If a Redis operation fails, the error is returned rather than silently
 // degrading to the local lock.
-func NewHybridLocker(client *redis.Client) *HybridLocker {
+func NewHybridLocker(client redis.UniversalClient) *HybridLocker {
 	hl := &HybridLocker{
 		localLocker: NewLocalLocker(),
 	}
 
-	if client != nil {
+	// Tested through nilcheck, not with client != nil. client is an interface
+	// now, so an unassigned *redis.Client field arrives as a non-nil interface
+	// holding a nil pointer: plain inequality would build a Redis-backed
+	// locker over it, turning what used to be a working process-local lock
+	// into a panic on the first Lock.
+	if !nilcheck.IsNil(client) {
 		hl.redisLocker = NewRedisLocker(client)
 	}
 
@@ -513,7 +530,7 @@ func NewHybridLocker(client *redis.Client) *HybridLocker {
 //
 // Mutual exclusion across instances is lost while the fallback is in effect.
 // Only use it where a concurrent second holder is acceptable.
-func NewHybridLockerWithLocalFallback(client *redis.Client) *HybridLocker {
+func NewHybridLockerWithLocalFallback(client redis.UniversalClient) *HybridLocker {
 	hl := NewHybridLocker(client)
 	hl.allowLocalFallback = true
 	return hl

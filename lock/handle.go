@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
 // releaseScript deletes the key only if it still carries our token.
@@ -40,7 +42,7 @@ func (e *uncertainLeaseError) Unwrap() []error {
 // caller's conservative deadline. The command may have waited in the client
 // pool and only just executed, so Redis can still hold the token for its full
 // TTL even though it is no longer safe to hand ownership to the caller.
-func rejectLateLease(ctx context.Context, client *redis.Client, key, token string, ttl time.Duration) error {
+func rejectLateLease(ctx context.Context, client redis.UniversalClient, key, token string, ttl time.Duration) error {
 	// Redis executed before delivering the successful reply, so one full TTL
 	// from this observation is a conservative upper bound even when the
 	// command spent most of its time queued before execution.
@@ -71,7 +73,7 @@ end
 // key alone and keep the token in a process-wide map, which cannot distinguish
 // two acquisitions of the same key.
 type Handle struct {
-	client *redis.Client
+	client redis.UniversalClient
 	key    string
 	token  string
 
@@ -114,7 +116,7 @@ func (h *Handle) ExpiresAt() time.Time {
 // contention, not an error. Any other non-nil error is a Redis failure and is
 // wrapped in ErrRedisUnavailable, so callers can fail closed rather than guess.
 func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration) (*Handle, error) {
-	if l.client == nil {
+	if nilcheck.IsNil(l.client) {
 		return nil, fmt.Errorf("%w: redis client is nil", ErrRedisUnavailable)
 	}
 	if ttl <= 0 {

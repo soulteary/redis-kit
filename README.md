@@ -11,6 +11,7 @@ A unified Redis utility library for Go projects. This package provides common Re
 
 ## Features
 
+- **Any client shape**: every helper takes a `redis.UniversalClient`, so standalone, Cluster, Sentinel and Ring all work
 - **Client Management**: Unified Redis client initialization and configuration
 - **Distributed Locking**: Redis-based distributed locks, with an opt-in fallback to local locks
 - **Rate Limiting**: Flexible rate limiting with support for user/IP/destination-based limits
@@ -23,6 +24,29 @@ A unified Redis utility library for Go projects. This package provides common Re
 go get github.com/soulteary/redis-kit
 ```
 
+## Which client do I pass?
+
+Whichever one you have. Every constructor and helper takes a
+`redis.UniversalClient`, so all four go-redis client shapes go in the same
+slot — no wrapper, no type assertion:
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
+rdb := redis.NewFailoverClient(&redis.FailoverOptions{MasterName: "mymaster", SentinelAddrs: addrs})
+rdb := redis.NewRing(&redis.RingOptions{Addrs: shards})
+
+c := cache.NewCache(rdb, "app:")
+l := lock.NewRedisLocker(rdb)
+r := ratelimit.NewRateLimiter(rdb)
+```
+
+No package here issues a multi-key or cross-slot command, so all of them run
+unchanged on a cluster. What a cluster does *not* give you is a safer lock: a
+key lives on one master, replication is asynchronous, and a failover can lose
+an acquisition that was already acknowledged. A single-master lock is only as
+safe as the failover behind it.
+
 ## Usage
 
 ### Client Management
@@ -34,11 +58,11 @@ import (
 )
 
 // Create a client with default configuration
-client, err := client.NewClientWithDefaults("localhost:6379")
+rdb, err := client.NewClientWithDefaults("localhost:6379")
 if err != nil {
     log.Fatal(err)
 }
-defer client.Close(client)
+defer client.Close(rdb)
 
 // Or use custom configuration
 cfg := client.DefaultConfig().
@@ -47,8 +71,32 @@ cfg := client.DefaultConfig().
     WithDB(0).
     WithPoolSize(20)
 
-client, err := client.NewClient(cfg)
+rdb, err := client.NewClient(cfg)
 ```
+
+For a cluster or a Sentinel deployment, `NewUniversalClient` builds whichever
+client the configuration describes — a failover client when `MasterName` is
+set, a cluster client for more than one address, a single-node client
+otherwise:
+
+```go
+// Redis Cluster
+rdb, err := client.NewUniversalClient(
+    client.DefaultConfig().WithAddrs("10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"),
+)
+
+// Sentinel. WithSentinelAuth is for the Sentinel nodes themselves, which
+// usually do not share credentials with the Redis server behind them.
+rdb, err := client.NewUniversalClient(
+    client.DefaultConfig().
+        WithAddrs("10.0.0.1:26379", "10.0.0.2:26379").
+        WithMasterName("mymaster").
+        WithSentinelAuth("sentinel-user", "sentinel-pass"),
+)
+```
+
+`NewClient` still returns a concrete `*redis.Client`, for when you need
+`Options()` or something that insists on the concrete type.
 
 ### Distributed Locking
 
@@ -231,13 +279,19 @@ if !status.Healthy {
 
 ```
 redis-kit/
+├── doc.go           # Module-level documentation; no code
 ├── client/          # Client initialization and management
 ├── lock/            # Distributed locking
 ├── ratelimit/       # Rate limiting
 ├── cache/           # Generic caching interface
-├── utils/           # Utility functions
-└── testutil/        # Testing utilities (mock Redis)
+├── utils/           # Utility functions (the only package not importing go-redis)
+├── testutil/        # Testing utilities (mock Redis)
+└── internal/        # Not importable; shared guards
 ```
+
+One module, one package per concern. Module graph pruning keeps a requirement
+none of your imported packages needs out of your `go.mod` and `go.sum`, so the
+packages you skip cost you nothing.
 
 ## Requirements
 
@@ -361,6 +415,43 @@ func main() {
     }
 }
 ```
+
+## Changelog
+
+Release-by-release detail, with the measured numbers behind each claim, lives
+in [CHANGELOG.md](CHANGELOG.md).
+
+## Upgrade Notes (unreleased)
+
+**Client parameters are now `redis.UniversalClient` instead of
+`*redis.Client`.** Existing code keeps compiling — `*redis.Client` satisfies
+the interface, so every call that worked before still works and no import
+changes. What is new is that a Cluster, Sentinel or Ring client now goes in
+the same slot; before, the compiler simply refused the call.
+
+- **Eleven functions changed parameter type**: `cache.NewCache`;
+  `client.Ping`, `Close`, `HealthCheck`, `CheckHealth`; `lock.NewRedisLocker`,
+  `NewRedisLockerWithLockTime`, `NewHybridLocker`,
+  `NewHybridLockerWithLocalFallback`; `ratelimit.NewRateLimiter`,
+  `NewRateLimiterWithPrefixes`. The only usage that breaks is taking one as a
+  value at its old concrete type, e.g.
+  `var f func(*redis.Client, string) *cache.RedisCache = cache.NewCache`.
+- **Your dependency footprint does not change.** No new module, nothing added
+  to `go.sum`, no new minimum version pushed onto you through MVS. Measured
+  for a program importing all four packages: same 13 modules and 22 `go.sum`
+  lines, one extra linked package, and a binary 0.25% larger.
+- **A typed nil is now handled.** An unassigned `*redis.Client` field becomes a
+  *non-nil* interface holding a nil pointer, which a `client == nil` check
+  misses — so every guard here looks inside the interface and still reports
+  `redis client is nil`. `NewHybridLocker` treats it as "no Redis" and gives
+  you the process-local lock, exactly as it does for an untyped nil.
+- **`client.NewUniversalClient` is new**, along with `Config.Addrs`,
+  `MasterName`, `SentinelUsername` and `SentinelPassword`. `NewClient` is
+  unchanged and still returns a concrete `*redis.Client`.
+- **A zero `DialTimeout` no longer fails every connection.** A hand-built
+  `Config{Addr: "..."}` produced an already-expired context, so the connection
+  test failed with `context deadline exceeded` before a packet was sent. It
+  now falls back to the documented 5s default.
 
 ## Upgrade Notes (v1.6.0)
 

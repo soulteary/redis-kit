@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
 // HealthStatus represents the health status of a Redis connection
@@ -16,13 +18,17 @@ type HealthStatus struct {
 	Timestamp time.Time
 }
 
-// CheckHealth performs a comprehensive health check
-func CheckHealth(ctx context.Context, client *redis.Client) HealthStatus {
+// CheckHealth performs a comprehensive health check.
+//
+// client is a redis.UniversalClient, so every go-redis client shape is
+// accepted. A nil client -- including a typed nil -- is reported as an
+// unhealthy status rather than dereferenced.
+func CheckHealth(ctx context.Context, client redis.UniversalClient) HealthStatus {
 	status := HealthStatus{
 		Timestamp: time.Now(),
 	}
 
-	if client == nil {
+	if nilcheck.IsNil(client) {
 		status.Error = fmt.Errorf("redis client is nil")
 		return status
 	}

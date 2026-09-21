@@ -14,6 +14,25 @@ type Config struct {
 	// Addr is the Redis server address (e.g., "localhost:6379")
 	Addr string
 
+	// Addrs is a seed list of host:port addresses, for a Redis Cluster or for
+	// the Sentinel nodes of a failover setup. It is read only by
+	// [NewUniversalClient]; [NewClient] always builds a single-node client
+	// from Addr. When it is empty, NewUniversalClient falls back to Addr.
+	Addrs []string
+
+	// MasterName is the Sentinel master name. Setting it makes
+	// [NewUniversalClient] return a Sentinel-backed failover client, with
+	// Addrs (or Addr) read as the Sentinel addresses rather than as Redis
+	// servers.
+	MasterName string
+
+	// SentinelUsername and SentinelPassword authenticate to the Sentinel
+	// nodes themselves. They are separate from Password, which authenticates
+	// to the Redis server Sentinel points at -- the two frequently differ,
+	// and a Sentinel deployment with ACLs is unusable without them.
+	SentinelUsername string
+	SentinelPassword string
+
 	// Password is the Redis password (empty if no password)
 	Password string
 
@@ -64,6 +83,28 @@ func DefaultConfig() Config {
 // WithAddr sets the Redis server address
 func (c Config) WithAddr(addr string) Config {
 	c.Addr = addr
+	return c
+}
+
+// WithAddrs sets the seed list of cluster or Sentinel addresses. Only
+// [NewUniversalClient] reads it.
+func (c Config) WithAddrs(addrs ...string) Config {
+	c.Addrs = addrs
+	return c
+}
+
+// WithMasterName sets the Sentinel master name, selecting a failover client in
+// [NewUniversalClient].
+func (c Config) WithMasterName(name string) Config {
+	c.MasterName = name
+	return c
+}
+
+// WithSentinelAuth sets the credentials used against the Sentinel nodes, which
+// are not the credentials used against the Redis server behind them.
+func (c Config) WithSentinelAuth(username, password string) Config {
+	c.SentinelUsername = username
+	c.SentinelPassword = password
 	return c
 }
 

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
 const (
@@ -58,18 +60,25 @@ return {0, ttl}
 
 // RateLimiter provides rate limiting functionality using Redis
 type RateLimiter struct {
-	client         *redis.Client
+	client         redis.UniversalClient
 	keyPrefix      string
 	cooldownPrefix string
 }
 
-// NewRateLimiter creates a new rate limiter with default prefixes
-func NewRateLimiter(client *redis.Client) *RateLimiter {
+// NewRateLimiter creates a new rate limiter with default prefixes.
+//
+// client is a redis.UniversalClient, so *redis.Client, *redis.ClusterClient,
+// *redis.Ring and a Sentinel-backed failover client all work here.
+//
+// Both scripts are single-key, so they run unchanged on a cluster: every key
+// a call touches is the one key it was given, and no cross-slot command is
+// ever issued.
+func NewRateLimiter(client redis.UniversalClient) *RateLimiter {
 	return NewRateLimiterWithPrefixes(client, DefaultKeyPrefix, DefaultCooldownPrefix)
 }
 
 // NewRateLimiterWithPrefixes creates a new rate limiter with custom prefixes
-func NewRateLimiterWithPrefixes(client *redis.Client, keyPrefix, cooldownPrefix string) *RateLimiter {
+func NewRateLimiterWithPrefixes(client redis.UniversalClient, keyPrefix, cooldownPrefix string) *RateLimiter {
 	return &RateLimiter{
 		client:         client,
 		keyPrefix:      keyPrefix,
@@ -80,7 +89,7 @@ func NewRateLimiterWithPrefixes(client *redis.Client, keyPrefix, cooldownPrefix 
 // CheckLimit checks if a request should be rate limited
 // Returns (allowed, remaining, resetTime, error)
 func (r *RateLimiter) CheckLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Time, error) {
-	if r.client == nil {
+	if nilcheck.IsNil(r.client) {
 		return false, 0, time.Time{}, fmt.Errorf("redis client is nil")
 	}
 
@@ -131,7 +140,7 @@ func (r *RateLimiter) CheckLimit(ctx context.Context, key string, limit int, win
 // CheckCooldown checks if resend is allowed (cooldown period)
 // Returns (allowed, resetTime, error)
 func (r *RateLimiter) CheckCooldown(ctx context.Context, key string, cooldown time.Duration) (bool, time.Time, error) {
-	if r.client == nil {
+	if nilcheck.IsNil(r.client) {
 		return false, time.Time{}, fmt.Errorf("redis client is nil")
 	}
 
