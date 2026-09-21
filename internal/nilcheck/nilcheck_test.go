@@ -46,16 +46,28 @@ func TestIsNil(t *testing.T) {
 	}
 }
 
+// service is how a typed nil actually reaches a constructor: a struct whose
+// client field was declared and never assigned a live client.
+//
+// The field also keeps the comparison below an honest runtime test. Assigning
+// a concrete-typed variable straight into a local interface lets the compiler
+// see both sides and fold the result, which is a real bug in production code
+// and is what staticcheck's SA4023 reports -- so writing the premise that way
+// would be asserting something the compiler had already decided.
+type service struct {
+	rdb redis.UniversalClient
+}
+
 // A typed nil assigned to redis.UniversalClient is the exact shape the
 // constructors receive, and it is not caught by comparing the interface to nil.
 func TestIsNilCatchesWhatEqualityMisses(t *testing.T) {
-	var client *redis.Client
-	var universal redis.UniversalClient = client
+	var unset *redis.Client // declared, never assigned a live client
+	svc := &service{rdb: unset}
 
-	if universal == nil {
+	if svc.rdb == nil {
 		t.Fatal("a typed nil in an interface should not compare equal to nil; the premise of this package is wrong")
 	}
-	if !IsNil(universal) {
+	if !IsNil(svc.rdb) {
 		t.Error("IsNil() = false for a redis.UniversalClient holding a nil *redis.Client, want true")
 	}
 }
