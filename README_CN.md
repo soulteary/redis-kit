@@ -11,6 +11,7 @@
 
 ## 功能特性
 
+- **任意客户端形态** - 所有入口都接收 `redis.UniversalClient`，单机、集群、哨兵、Ring 均可直接传入
 - **客户端管理** - 统一的 Redis 客户端初始化和配置
 - **分布式锁** - 基于 Redis 的分布式锁，可选地降级到本地锁
 - **限流器** - 灵活的限流功能，支持用户/IP/目标地址的限流
@@ -23,6 +24,27 @@
 go get github.com/soulteary/redis-kit
 ```
 
+## 该传哪种客户端？
+
+手里有哪种就传哪种。所有构造函数和辅助函数都接收 `redis.UniversalClient`，
+go-redis 的四种客户端形态都能放进同一个位置，不需要包装，也不需要类型断言：
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs})
+rdb := redis.NewFailoverClient(&redis.FailoverOptions{MasterName: "mymaster", SentinelAddrs: addrs})
+rdb := redis.NewRing(&redis.RingOptions{Addrs: shards})
+
+c := cache.NewCache(rdb, "app:")
+l := lock.NewRedisLocker(rdb)
+r := ratelimit.NewRateLimiter(rdb)
+```
+
+本仓库不发送任何多键或跨 slot 命令，因此所有包在集群下都能原样运行。但集群
+并不会让锁更安全：一个 key 只落在一个主节点上，复制是异步的，故障切换可能丢
+失一次已经返回成功的加锁。单主锁的安全性上限，就是它背后故障切换的可靠性 ——
+换哪种客户端都一样。
+
 ## 快速开始
 
 ### 客户端管理
@@ -34,11 +56,11 @@ import (
 )
 
 // 使用默认配置创建客户端
-client, err := client.NewClientWithDefaults("localhost:6379")
+rdb, err := client.NewClientWithDefaults("localhost:6379")
 if err != nil {
     log.Fatal(err)
 }
-defer client.Close(client)
+defer client.Close(rdb)
 
 // 或使用自定义配置
 cfg := client.DefaultConfig().
@@ -47,8 +69,31 @@ cfg := client.DefaultConfig().
     WithDB(0).
     WithPoolSize(20)
 
-client, err := client.NewClient(cfg)
+rdb, err := client.NewClient(cfg)
 ```
+
+集群或哨兵部署用 `NewUniversalClient`，它按配置决定创建哪种客户端：设置了
+`MasterName` 就是哨兵故障转移客户端，地址多于一个就是集群客户端，否则是单机
+客户端：
+
+```go
+// Redis 集群
+rdb, err := client.NewUniversalClient(
+    client.DefaultConfig().WithAddrs("10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"),
+)
+
+// 哨兵。WithSentinelAuth 是给哨兵节点本身用的凭据，
+// 它通常和背后 Redis 服务器的凭据并不相同。
+rdb, err := client.NewUniversalClient(
+    client.DefaultConfig().
+        WithAddrs("10.0.0.1:26379", "10.0.0.2:26379").
+        WithMasterName("mymaster").
+        WithSentinelAuth("sentinel-user", "sentinel-pass"),
+)
+```
+
+`NewClient` 保持不变，仍然返回具体的 `*redis.Client` —— 需要 `Options()`，
+或者要对接只认具体类型的代码时用它。
 
 ### 分布式锁
 
@@ -226,13 +271,18 @@ if !status.Healthy {
 
 ```
 redis-kit/
+├── doc.go           # 模块级文档，不含代码
 ├── client/          # 客户端初始化和管理
 ├── lock/            # 分布式锁
 ├── ratelimit/       # 限流器
 ├── cache/           # 通用缓存接口
-├── utils/           # 工具函数
-└── testutil/        # 测试工具（Mock Redis）
+├── utils/           # 工具函数（唯一不依赖 go-redis 的包）
+├── testutil/        # 测试工具（Mock Redis）
+└── internal/        # 不可被外部导入，存放共享的防御性检查
 ```
+
+单模块，一个关注点一个包。module graph pruning 会把你没有导入到的依赖挡在
+`go.mod` 和 `go.sum` 之外，所以用不到的包不会让你付出任何代价。
 
 ## 环境要求
 
@@ -356,6 +406,40 @@ func main() {
     }
 }
 ```
+
+## 变更日志
+
+逐版本的详细说明，以及每条结论背后的实测数字，见
+[CHANGELOG.md](CHANGELOG.md)。
+
+## 升级说明（未发布）
+
+**客户端参数从 `*redis.Client` 改为 `redis.UniversalClient`。** 现有代码不需要
+改动 —— `*redis.Client` 满足该接口，之前能编译的调用现在照样能编译，import 也
+不用动。新增的是：集群、哨兵、Ring 客户端现在也能放进同一个位置，而在此之前编
+译器会直接拒绝这些调用。
+
+- **十一个函数的参数类型变了**：`cache.NewCache`；`client.Ping`、`Close`、
+  `HealthCheck`、`CheckHealth`；`lock.NewRedisLocker`、
+  `NewRedisLockerWithLockTime`、`NewHybridLocker`、
+  `NewHybridLockerWithLocalFallback`；`ratelimit.NewRateLimiter`、
+  `NewRateLimiterWithPrefixes`。唯一会编译失败的写法，是按旧的具体类型把函数
+  当值来接，例如
+  `var f func(*redis.Client, string) *cache.RedisCache = cache.NewCache`。
+- **依赖体积没有变化。** 没有新模块，`go.sum` 没有新增条目，也没有通过 MVS 把
+  任何新的最低版本传递给使用者。实测一个同时导入四个包的程序：模块数仍是 13
+  个，`go.sum` 仍是 22 行，链接的包多了 1 个，二进制大了 0.25%。
+- **现在能正确处理 typed nil。** 未赋值的 `*redis.Client` 字段放进接口后是一个
+  **非 nil** 的接口值、里面装着 nil 指针，`client == nil` 检查不出来 —— 所以本
+  仓库所有判空都改为检查接口内部，并且仍然返回 `redis client is nil`。
+  `NewHybridLocker` 会把它当成「没有 Redis」，和传入无类型 nil 时一样退回到进
+  程内本地锁。
+- **新增 `client.NewUniversalClient`**，以及 `Config.Addrs`、`MasterName`、
+  `SentinelUsername`、`SentinelPassword`。`NewClient` 保持不变，仍返回具体的
+  `*redis.Client`。
+- **`DialTimeout` 为零不再导致每次连接都失败。** 手工构造的
+  `Config{Addr: "..."}` 会得到一个已经过期的 context，连接测试在发出任何数据包
+  之前就以 `context deadline exceeded` 失败。现在会回退到文档写明的 5 秒默认值。
 
 ## 升级说明（v1.6.0）
 
