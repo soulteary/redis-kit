@@ -1,0 +1,74 @@
+{
+  "schema_version": "1.0",
+  "tests": {
+    "total": 140,
+    "passed": 140,
+    "failed": 0,
+    "skipped": 0
+  },
+  "coverage": {
+    "covered_statements": 801,
+    "total_statements": 895,
+    "percentage": 89.5,
+    "threshold": 0
+  },
+  "packages": [
+    {
+      "name": ".",
+      "status": "no_tests",
+      "tests": 0,
+      "failed": 0,
+      "coverage": null
+    },
+    {
+      "name": "cache",
+      "status": "pass",
+      "tests": 21,
+      "failed": 0,
+      "coverage": 100
+    },
+    {
+      "name": "client",
+      "status": "pass",
+      "tests": 23,
+      "failed": 0,
+      "coverage": 100
+    },
+    {
+      "name": "internal/nilcheck",
+      "status": "pass",
+      "tests": 2,
+      "failed": 0,
+      "coverage": 100
+    },
+    {
+      "name": "lock",
+      "status": "pass",
+      "tests": 46,
+      "failed": 0,
+      "coverage": 90.93
+    },
+    {
+      "name": "ratelimit",
+      "status": "pass",
+      "tests": 17,
+      "failed": 0,
+      "coverage": 86.15
+    },
+    {
+      "name": "testutil",
+      "status": "pass",
+      "tests": 27,
+      "failed": 0,
+      "coverage": 83.69
+    },
+    {
+      "name": "utils",
+      "status": "pass",
+      "tests": 4,
+      "failed": 0,
+      "coverage": 100
+    }
+  ],
+  "failures": null
+}
