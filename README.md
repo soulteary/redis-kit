@@ -295,7 +295,7 @@ packages you skip cost you nothing.
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.0`)
+- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
 - Redis server (optional for testing, mock Redis is provided)
 
 ## Test Coverage
