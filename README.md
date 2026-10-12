@@ -292,7 +292,7 @@ packages you skip cost you nothing.
 
 ## Requirements
 
-- **Go 1.27+** (`go.mod` declares `go 1.27.2`)
+- **Go 1.27.2+** (`go.mod` declares `go 1.27.2`)
 - Redis server (optional for testing, mock Redis is provided)
 
 ## Test Coverage
@@ -508,3 +508,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE) for details.
+
+Clients built by `client.NewClient` and `client.NewUniversalClient` set `PipelinePoolSize: -1`, retaining the shared connection pool used before go-redis v9.23.0. `PoolSize` is therefore not supplemented by a separate pipeline pool. For cluster clients the configured pool applies per node.
