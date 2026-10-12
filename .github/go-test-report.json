@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0",
   "tests": {
-    "total": 140,
-    "passed": 140,
+    "total": 141,
+    "passed": 141,
     "failed": 0,
     "skipped": 0
   },
@@ -30,7 +30,7 @@
     {
       "name": "client",
       "status": "pass",
-      "tests": 23,
+      "tests": 24,
       "failed": 0,
       "coverage": 100
     },
