@@ -283,7 +283,7 @@ redis-kit/
 
 ## 环境要求
 
-- **Go 1.27+**（`go.mod` 声明 `go 1.27.2`）
+- **Go 1.27.2+**（`go.mod` 声明 `go 1.27.2`）
 - Redis 服务器（测试时可选，提供 Mock Redis）
 
 ## 测试覆盖率
@@ -487,3 +487,5 @@ func main() {
 ## 许可证
 
 Apache License 2.0 —— 详见 [LICENSE](LICENSE)。
+
+`client.NewClient` 和 `client.NewUniversalClient` 创建的客户端固定使用 `PipelinePoolSize: -1`，保留 go-redis v9.23.0 之前普通命令与 pipeline 共用连接池的行为，不在 `PoolSize` 外额外建立 pipeline 池。集群客户端的连接池配置按节点生效。

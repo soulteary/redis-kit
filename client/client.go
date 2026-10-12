@@ -17,16 +17,18 @@ func NewClient(cfg Config) (*redis.Client, error) {
 	}
 
 	opts := &redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		PoolSize:     cfg.PoolSize,
-		MinIdleConns: cfg.MinIdleConns,
-		DialTimeout:  cfg.DialTimeout,
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
-		MaxRetries:   cfg.MaxRetries,
-		PoolTimeout:  cfg.PoolTimeout,
+		Addr:     cfg.Addr,
+		Password: cfg.Password,
+		DB:       cfg.DB,
+		PoolSize: cfg.PoolSize,
+		// Keep pipelines in the same pool so PoolSize remains the connection ceiling.
+		PipelinePoolSize: -1,
+		MinIdleConns:     cfg.MinIdleConns,
+		DialTimeout:      cfg.DialTimeout,
+		ReadTimeout:      cfg.ReadTimeout,
+		WriteTimeout:     cfg.WriteTimeout,
+		MaxRetries:       cfg.MaxRetries,
+		PoolTimeout:      cfg.PoolTimeout,
 	}
 	if cfg.Dialer != nil {
 		opts.Dialer = cfg.Dialer
@@ -71,6 +73,8 @@ func NewUniversalClient(cfg Config) (redis.UniversalClient, error) {
 		SentinelPassword: cfg.SentinelPassword,
 		DB:               cfg.DB,
 		PoolSize:         cfg.PoolSize,
+		// Apply the same ceiling to standalone, failover and cluster node pipelines.
+		PipelinePoolSize: -1,
 		MinIdleConns:     cfg.MinIdleConns,
 		DialTimeout:      cfg.DialTimeout,
 		ReadTimeout:      cfg.ReadTimeout,
