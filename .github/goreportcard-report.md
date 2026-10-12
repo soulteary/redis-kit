@@ -13,8 +13,8 @@
 | ----- | ----- |
 | gofmt | 100% |
 | go_vet | 100% |
-| gocyclo | 78% |
 | ineffassign | 100% |
+| gocyclo | 78% |
 | license | 100% |
 | misspell | 100% |
 
@@ -22,6 +22,16 @@
 
 ### gocyclo
 
+- `testutil/mock_redis.go`
+  - Line 330: cyclomatic complexity 37 for function (*MockRedis).handleEval
+- `lock/locker_test.go`
+  - Line 304: cyclomatic complexity 32 for function TestHybridLocker
+  - Line 722: cyclomatic complexity 19 for function TestFallbackRoutingIsSerializedPerKey
+  - Line 157: cyclomatic complexity 16 for function TestRedisLocker_Unlock
+- `testutil/mock_redis_test.go`
+  - Line 456: cyclomatic complexity 21 for function TestMockRedis_Eval_RateLimitAndCooldown
+- `lock/handle_test.go`
+  - Line 376: cyclomatic complexity 19 for function TestLockOperationsRejectRepliesAfterDeadline
 - `lock/locker.go`
   - Line 544: cyclomatic complexity 18 for function (*HybridLocker).Lock
 - `cache/redis_test.go`
@@ -33,16 +43,6 @@
   - Line 49: cyclomatic complexity 44 for function TestRateLimiter_CheckLimit
   - Line 338: cyclomatic complexity 26 for function TestRateLimiter_CheckCooldown
   - Line 723: cyclomatic complexity 16 for function TestRateLimiter_EdgeCases
-- `testutil/mock_redis.go`
-  - Line 330: cyclomatic complexity 37 for function (*MockRedis).handleEval
-- `lock/locker_test.go`
-  - Line 304: cyclomatic complexity 32 for function TestHybridLocker
-  - Line 722: cyclomatic complexity 19 for function TestFallbackRoutingIsSerializedPerKey
-  - Line 157: cyclomatic complexity 16 for function TestRedisLocker_Unlock
-- `testutil/mock_redis_test.go`
-  - Line 456: cyclomatic complexity 21 for function TestMockRedis_Eval_RateLimitAndCooldown
-- `lock/handle_test.go`
-  - Line 376: cyclomatic complexity 19 for function TestLockOperationsRejectRepliesAfterDeadline
 
 ---
 
