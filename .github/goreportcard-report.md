@@ -11,10 +11,10 @@
 
 | Check | Score |
 | ----- | ----- |
-| gofmt | 100% |
 | go_vet | 100% |
-| ineffassign | 100% |
+| gofmt | 100% |
 | gocyclo | 78% |
+| ineffassign | 100% |
 | license | 100% |
 | misspell | 100% |
 
@@ -22,6 +22,12 @@
 
 ### gocyclo
 
+- `client/health_test.go`
+  - Line 12: cyclomatic complexity 17 for function TestCheckHealth
+- `ratelimit/manager_test.go`
+  - Line 49: cyclomatic complexity 44 for function TestRateLimiter_CheckLimit
+  - Line 338: cyclomatic complexity 26 for function TestRateLimiter_CheckCooldown
+  - Line 723: cyclomatic complexity 16 for function TestRateLimiter_EdgeCases
 - `testutil/mock_redis.go`
   - Line 330: cyclomatic complexity 37 for function (*MockRedis).handleEval
 - `lock/locker_test.go`
@@ -37,12 +43,6 @@
 - `cache/redis_test.go`
   - Line 444: cyclomatic complexity 18 for function TestRedisCache_KeyPrefix
   - Line 138: cyclomatic complexity 16 for function TestRedisCache_Get
-- `client/health_test.go`
-  - Line 12: cyclomatic complexity 17 for function TestCheckHealth
-- `ratelimit/manager_test.go`
-  - Line 49: cyclomatic complexity 44 for function TestRateLimiter_CheckLimit
-  - Line 338: cyclomatic complexity 26 for function TestRateLimiter_CheckCooldown
-  - Line 723: cyclomatic complexity 16 for function TestRateLimiter_EdgeCases
 
 ---
 
