@@ -10,6 +10,38 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-10-25
+
+### Added
+
+- Redis ACL authentication through `Config.Username` and `WithUsername`, for
+  both single-node and universal clients. An empty username keeps using the
+  default Redis user.
+- TLS configuration through `Config.TLSConfig` and `WithTLSConfig`. Builders
+  and constructors clone the configuration; certificate verification follows
+  the supplied `tls.Config`. Custom dialers remain responsible for their own
+  transport, including TLS.
+- `NewClientContext` and `NewUniversalClientContext`. The caller's context and
+  `DialTimeout` bound the complete startup process, including dialing, TLS
+  negotiation, authentication and PING. Cancelling the startup context after a
+  successful return does not close the returned client.
+- `Config.ContextTimeoutEnabled` and `WithContextTimeoutEnabled` to apply
+  subsequent command context deadlines to socket reads and writes. This is
+  opt-in; the context-aware constructors always honor their startup context.
+- TCP/TLS RESP endpoint tests covering authentication, certificate trust,
+  startup cancellation and deadlines, command deadlines, and client lifetime.
+
+### Fixed
+
+- Apply the startup timeout to TLS negotiation, authentication and PING even
+  when command context timeouts are disabled, and close failed connections.
+
+### Compatibility
+
+- Existing constructors and defaults remain available. The default command
+  retry count remains three; use `WithMaxRetries(-1)` to disable retries.
+- No new module dependencies. The required Go version remains **1.27.3+**.
+
 ## [1.7.0] — 2026-09-21
 
 ### Changed
