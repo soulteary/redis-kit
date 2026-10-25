@@ -75,7 +75,11 @@ func newConnectionServer(t *testing.T, tlsConfig *tls.Config, username, password
 			s.connections = append(s.connections, conn)
 			s.wg.Add(1)
 			s.mu.Unlock()
-			go func() { defer s.wg.Done(); defer conn.Close(); s.serve(conn) }()
+			go func() {
+				defer s.wg.Done()
+				defer func() { _ = conn.Close() }()
+				s.serve(conn)
+			}()
 		}
 	}()
 	t.Cleanup(func() {
@@ -177,7 +181,7 @@ func TestConstructorsAuthenticateACLAndDefaultUser(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer rdb.Close()
+				defer func() { _ = rdb.Close() }()
 				if err := rdb.Ping(context.Background()).Err(); err != nil {
 					t.Fatalf("startup cancellation closed returned client: %v", err)
 				}
@@ -346,7 +350,7 @@ func TestCommandDeadlineAfterStartup(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer rdb.Close()
+			defer func() { _ = rdb.Close() }()
 			server.stallPing.Store(true)
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 			defer cancel()
@@ -396,7 +400,7 @@ func TestConstructorsVerifyTLSAndCloneConfiguration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer rdb.Close()
+			defer func() { _ = rdb.Close() }()
 			opts := rdb.(*redis.Client).Options()
 			if opts.TLSConfig == cfg.TLSConfig || opts.TLSConfig.ServerName != "redis.test" {
 				t.Fatal("constructor did not clone TLS configuration")
@@ -423,7 +427,7 @@ func TestConstructorsCancelTLSHandshake(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer listener.Close()
+			defer func() { _ = listener.Close() }()
 			accepted := make(chan net.Conn, 1)
 			go func() {
 				conn, err := listener.Accept()
@@ -439,7 +443,7 @@ func TestConstructorsCancelTLSHandshake(t *testing.T) {
 			go func() { _, err := constructor(ctx, cfg); result <- err }()
 			select {
 			case conn := <-accepted:
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 			case <-time.After(time.Second):
 				t.Fatal("TLS connection not accepted")
 			}
