@@ -95,6 +95,58 @@ rdb, err := client.NewUniversalClient(
 `NewClient` still returns a concrete `*redis.Client`, for when you need
 `Options()` or something that insists on the concrete type.
 
+#### ACL, TLS and startup context
+
+```go
+import (
+    "context"
+    "crypto/tls"
+    "time"
+
+    "github.com/soulteary/redis-kit/client"
+)
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+cfg := client.DefaultConfig().
+    WithAddr("redis.example.com:6379").
+    WithUsername("application").
+    WithPassword("secret").
+    WithTLSConfig(&tls.Config{
+        MinVersion: tls.VersionTLS12,
+        ServerName: "redis.example.com",
+    }).
+    WithContextTimeoutEnabled(true).
+    WithMaxRetries(-1)
+
+rdb, err := client.NewClientContext(ctx, cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer rdb.Close()
+```
+
+`Username` and `Password` authenticate to Redis. An empty username retains
+password-only authentication to the default user. Sentinel credentials remain
+separate: use `WithSentinelAuth` for the Sentinel nodes.
+
+`TLSConfig` enables certificate-verified TLS; use `RootCAs` for a private CA and
+`Certificates` for mutual TLS. The builder and constructors clone the TLS config.
+A custom `Dialer` owns its transport, including TLS.
+
+`NewClientContext` and `NewUniversalClientContext` bound the complete connection
+test — dialing, TLS, authentication and PING — by the earlier of the supplied
+context deadline and `DialTimeout` (5 seconds when unset). Cancellation also
+interrupts startup. The context does not control the returned client's lifetime.
+Existing constructors use a background context and remain available.
+
+`WithContextTimeoutEnabled(true)` additionally applies each subsequent command's
+context deadline to socket I/O; it defaults to false for compatibility. Supply
+a deadline when a command must have a fixed budget. `WithMaxRetries(-1)` disables
+command retries for callers that must handle an unknown write outcome themselves;
+the library default remains 3. A retry count of zero uses go-redis's default.
+
 ### Distributed Locking
 
 ```go

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"time"
 )
@@ -27,14 +28,28 @@ type Config struct {
 	MasterName string
 
 	// SentinelUsername and SentinelPassword authenticate to the Sentinel
-	// nodes themselves. They are separate from Password, which authenticates
+	// nodes themselves. They are separate from Username/Password, which authenticate
 	// to the Redis server Sentinel points at -- the two frequently differ,
 	// and a Sentinel deployment with ACLs is unusable without them.
 	SentinelUsername string
 	SentinelPassword string
 
+	// Username is the Redis ACL username. An empty value uses the default user.
+	Username string
+
 	// Password is the Redis password (empty if no password)
 	Password string
+
+	// TLSConfig enables TLS for Redis connections. Constructors clone this
+	// configuration before passing it to go-redis. A custom Dialer owns its
+	// transport, including TLS, when provided.
+	TLSConfig *tls.Config
+
+	// ContextTimeoutEnabled makes go-redis apply command context deadlines to
+	// socket reads and writes. It defaults to false for compatibility. The
+	// context-aware constructors always honor their startup context regardless
+	// of this setting; it controls subsequent commands on the returned client.
+	ContextTimeoutEnabled bool
 
 	// DB is the Redis database number (default: 0)
 	DB int
@@ -108,6 +123,29 @@ func (c Config) WithSentinelAuth(username, password string) Config {
 	return c
 }
 
+// WithUsername sets the Redis ACL username (empty selects the default user).
+func (c Config) WithUsername(username string) Config {
+	c.Username = username
+	return c
+}
+
+// WithTLSConfig enables TLS. A nil configuration disables TLS. The value is
+// cloned here and again by constructors to isolate top-level configuration changes.
+func (c Config) WithTLSConfig(config *tls.Config) Config {
+	if config == nil {
+		c.TLSConfig = nil
+	} else {
+		c.TLSConfig = config.Clone()
+	}
+	return c
+}
+
+// WithContextTimeoutEnabled controls whether command deadlines bound socket I/O.
+func (c Config) WithContextTimeoutEnabled(enabled bool) Config {
+	c.ContextTimeoutEnabled = enabled
+	return c
+}
+
 // WithPassword sets the Redis password
 func (c Config) WithPassword(password string) Config {
 	c.Password = password
@@ -150,7 +188,8 @@ func (c Config) WithWriteTimeout(timeout time.Duration) Config {
 	return c
 }
 
-// WithMaxRetries sets the maximum number of retries
+// WithMaxRetries sets the maximum number of retries. Use -1 to disable retries;
+// go-redis interprets zero as its default, not as "no retries".
 func (c Config) WithMaxRetries(retries int) Config {
 	c.MaxRetries = retries
 	return c

@@ -12,31 +12,47 @@ import (
 
 // NewClient creates a new Redis client with the given configuration
 func NewClient(cfg Config) (*redis.Client, error) {
+	return NewClientContext(context.Background(), cfg)
+}
+
+// NewClientContext creates a single-node client and verifies it with PING.
+// ctx cancellation and the smaller of its deadline and DialTimeout bound the
+// entire startup, including dialing, TLS, authentication and PING. Once this
+// function returns, ctx does not control the lifetime of the client.
+func NewClientContext(ctx context.Context, cfg Config) (*redis.Client, error) {
 	if cfg.Addr == "" {
 		return nil, fmt.Errorf("redis address is required")
 	}
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout(cfg))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+	dialer, detach := startupDialer(ctx, cfg)
+	defer detach()
 
 	opts := &redis.Options{
 		Addr:     cfg.Addr,
+		Username: cfg.Username,
 		Password: cfg.Password,
 		DB:       cfg.DB,
 		PoolSize: cfg.PoolSize,
 		// Keep pipelines in the same pool so PoolSize remains the connection ceiling.
-		PipelinePoolSize: -1,
-		MinIdleConns:     cfg.MinIdleConns,
-		DialTimeout:      cfg.DialTimeout,
-		ReadTimeout:      cfg.ReadTimeout,
-		WriteTimeout:     cfg.WriteTimeout,
-		MaxRetries:       cfg.MaxRetries,
-		PoolTimeout:      cfg.PoolTimeout,
-	}
-	if cfg.Dialer != nil {
-		opts.Dialer = cfg.Dialer
+		PipelinePoolSize:      -1,
+		MinIdleConns:          cfg.MinIdleConns,
+		DialTimeout:           cfg.DialTimeout,
+		ReadTimeout:           cfg.ReadTimeout,
+		WriteTimeout:          cfg.WriteTimeout,
+		MaxRetries:            cfg.MaxRetries,
+		PoolTimeout:           cfg.PoolTimeout,
+		TLSConfig:             cloneTLSConfig(cfg.TLSConfig),
+		ContextTimeoutEnabled: cfg.ContextTimeoutEnabled,
+		Dialer:                dialer,
 	}
 
 	client := redis.NewClient(opts)
 
-	if err := verifyConnection(client, cfg); err != nil {
+	if err := verifyConnection(ctx, client); err != nil {
 		return nil, err
 	}
 
@@ -54,9 +70,14 @@ func NewClient(cfg Config) (*redis.Client, error) {
 // to pass it somewhere that still insists on the concrete type.
 //
 // The field mapping is written out here rather than routed through
-// [redis.UniversalOptions.Simple], so that NewClient keeps producing exactly
-// the options it always did.
+// [redis.UniversalOptions.Simple], keeping the standalone field mapping explicit.
 func NewUniversalClient(cfg Config) (redis.UniversalClient, error) {
+	return NewUniversalClientContext(context.Background(), cfg)
+}
+
+// NewUniversalClientContext selects the same client shape as
+// [NewUniversalClient], with the startup context semantics of [NewClientContext].
+func NewUniversalClientContext(ctx context.Context, cfg Config) (redis.UniversalClient, error) {
 	addrs := cfg.Addrs
 	if len(addrs) == 0 {
 		if cfg.Addr == "" {
@@ -64,31 +85,39 @@ func NewUniversalClient(cfg Config) (redis.UniversalClient, error) {
 		}
 		addrs = []string{cfg.Addr}
 	}
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout(cfg))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+	dialer, detach := startupDialer(ctx, cfg)
+	defer detach()
 
 	opts := &redis.UniversalOptions{
 		Addrs:            addrs,
 		MasterName:       cfg.MasterName,
+		Username:         cfg.Username,
 		Password:         cfg.Password,
 		SentinelUsername: cfg.SentinelUsername,
 		SentinelPassword: cfg.SentinelPassword,
 		DB:               cfg.DB,
 		PoolSize:         cfg.PoolSize,
 		// Apply the same ceiling to standalone, failover and cluster node pipelines.
-		PipelinePoolSize: -1,
-		MinIdleConns:     cfg.MinIdleConns,
-		DialTimeout:      cfg.DialTimeout,
-		ReadTimeout:      cfg.ReadTimeout,
-		WriteTimeout:     cfg.WriteTimeout,
-		MaxRetries:       cfg.MaxRetries,
-		PoolTimeout:      cfg.PoolTimeout,
-	}
-	if cfg.Dialer != nil {
-		opts.Dialer = cfg.Dialer
+		PipelinePoolSize:      -1,
+		MinIdleConns:          cfg.MinIdleConns,
+		DialTimeout:           cfg.DialTimeout,
+		ReadTimeout:           cfg.ReadTimeout,
+		WriteTimeout:          cfg.WriteTimeout,
+		MaxRetries:            cfg.MaxRetries,
+		PoolTimeout:           cfg.PoolTimeout,
+		TLSConfig:             cloneTLSConfig(cfg.TLSConfig),
+		ContextTimeoutEnabled: cfg.ContextTimeoutEnabled,
+		Dialer:                dialer,
 	}
 
 	client := redis.NewUniversalClient(opts)
 
-	if err := verifyConnection(client, cfg); err != nil {
+	if err := verifyConnection(ctx, client); err != nil {
 		return nil, err
 	}
 
@@ -98,11 +127,21 @@ func NewUniversalClient(cfg Config) (redis.UniversalClient, error) {
 // verifyConnection pings a freshly built client and closes it if the server
 // does not answer, so a constructor never hands back a client that was already
 // known to be unreachable.
-func verifyConnection(client redis.UniversalClient, cfg Config) error {
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout(cfg))
-	defer cancel()
-
-	if err := client.Ping(ctx).Err(); err != nil {
+func verifyConnection(ctx context.Context, client redis.UniversalClient) error {
+	// Closing the client interrupts authentication/PING even when command
+	// context deadlines are disabled. Do not leave a cancellation callback
+	// attached to a successfully returned client.
+	stop := context.AfterFunc(ctx, func() { _ = client.Close() })
+	err := client.Ping(ctx).Err()
+	stopped := stop()
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if deadline, ok := ctx.Deadline(); err != nil && ok && !time.Now().Before(deadline) {
+		// Socket deadlines can fire just before the context's timer goroutine.
+		// Report the constructor's expired budget consistently in that race.
+		err = context.DeadlineExceeded
+	}
+	if !stopped || err != nil {
 		_ = client.Close()
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
