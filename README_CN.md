@@ -92,6 +92,56 @@ rdb, err := client.NewUniversalClient(
 `NewClient` 保持不变，仍然返回具体的 `*redis.Client` —— 需要 `Options()`，
 或者要对接只认具体类型的代码时用它。
 
+#### ACL、TLS 和启动 context
+
+```go
+import (
+    "context"
+    "crypto/tls"
+    "time"
+
+    "github.com/soulteary/redis-kit/client"
+)
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+cfg := client.DefaultConfig().
+    WithAddr("redis.example.com:6379").
+    WithUsername("application").
+    WithPassword("secret").
+    WithTLSConfig(&tls.Config{
+        MinVersion: tls.VersionTLS12,
+        ServerName: "redis.example.com",
+    }).
+    WithContextTimeoutEnabled(true).
+    WithMaxRetries(-1)
+
+rdb, err := client.NewClientContext(ctx, cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer rdb.Close()
+```
+
+`Username` 和 `Password` 用于 Redis 认证。用户名为空时保留默认用户的仅密码
+认证行为。哨兵凭据仍然独立，使用 `WithSentinelAuth` 配置。
+
+`TLSConfig` 启用验证服务器证书的 TLS 连接；私有 CA 通过 `RootCAs` 配置，
+双向 TLS 通过 `Certificates` 配置。builder 和构造器会克隆 TLS 配置。
+如果提供自定义 `Dialer`，则由它负责传输层，包括 TLS。
+
+`NewClientContext` 和 `NewUniversalClientContext` 对完整连接测试设置预算，
+包括拨号、TLS 握手、认证和 PING，取调用方 context 截止时间与 `DialTimeout`
+中的较早者；未设置 `DialTimeout` 时使用 5 秒。取消 context 也会中断启动。
+构造成功后，该 context 不控制客户端生命周期。现有构造器继续可用，使用
+background context。
+
+`WithContextTimeoutEnabled(true)` 让后续每条命令的 context 截止时间也约束
+socket I/O，默认仍为 false，以保持兼容。需要固定命令预算时应提供截止时间。
+`WithMaxRetries(-1)` 禁用命令重试，适用于需要自行处理写入结果不确定性的调用方；
+库默认仍重试 3 次。重试次数为零时，go-redis 会使用其默认值。
+
 ### 分布式锁
 
 ```go

@@ -1,9 +1,30 @@
 package client
 
 import (
+	"crypto/tls"
 	"testing"
 	"time"
 )
+
+func TestConnectionConfigBuilders(t *testing.T) {
+	original := DefaultConfig()
+	callerTLS := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: "redis.test"}
+	cfg := original.WithUsername("application").WithTLSConfig(callerTLS).WithContextTimeoutEnabled(true)
+	if original.Username != "" || original.TLSConfig != nil || original.ContextTimeoutEnabled {
+		t.Fatal("connection builders modified the original config")
+	}
+	callerTLS.ServerName = "changed"
+	if cfg.Username != "application" || !cfg.ContextTimeoutEnabled || cfg.TLSConfig == callerTLS || cfg.TLSConfig.ServerName != "redis.test" {
+		t.Fatal("connection builders lost configuration or shared caller TLS config")
+	}
+	cleared := cfg.WithUsername("").WithTLSConfig(nil).WithContextTimeoutEnabled(false)
+	if cleared.Username != "" || cleared.TLSConfig != nil || cleared.ContextTimeoutEnabled {
+		t.Fatal("connection builders did not reset optional fields")
+	}
+	if cfg.Username != "application" || cfg.TLSConfig == nil || !cfg.ContextTimeoutEnabled {
+		t.Fatal("reset builders modified their input config")
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
