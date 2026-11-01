@@ -142,8 +142,7 @@ func (s *connectionServer) serve(conn net.Conn) {
 		case "HELLO":
 			response = "-ERR unknown command HELLO\r\n"
 		case "AUTH":
-			if (len(args) == 2 && s.username == "" && args[1] == s.password) ||
-				(len(args) == 3 && args[1] == s.username && args[2] == s.password) {
+			if s.authMatches(args) {
 				authenticated = true
 			} else {
 				response = "-WRONGPASS invalid username-password pair\r\n"
@@ -458,4 +457,9 @@ func TestConstructorsCancelTLSHandshake(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (s *connectionServer) authMatches(args []string) bool {
+	return (len(args) == 2 && s.username == "" && args[1] == s.password) ||
+		(len(args) == 3 && args[1] == s.username && args[2] == s.password)
 }
