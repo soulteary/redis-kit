@@ -459,86 +459,28 @@ func TestMockRedis_Eval_RateLimitAndCooldown(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("eval ratelimit script - new key", func(t *testing.T) {
-		result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey1"}, 10, 3600000).Result()
-		if err != nil {
-			t.Fatalf("Eval ratelimit error = %v", err)
-		}
-		sl, ok := result.([]interface{})
-		if !ok || len(sl) != 3 {
-			t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
-		}
-	})
+	t.Run("eval ratelimit script - new key", func(t *testing.T) { checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptNewKey(t, client, ctx) })
 
 	t.Run("eval ratelimit script - existing key under limit", func(t *testing.T) {
-		_, _ = client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey2"}, 10, 3600000).Result()
-		result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey2"}, 10, 3600000).Result()
-		if err != nil {
-			t.Fatalf("Eval ratelimit error = %v", err)
-		}
-		sl, ok := result.([]interface{})
-		if !ok || len(sl) != 3 {
-			t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
-		}
+		checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptExistingKeyUnderLimit(t, client, ctx)
 	})
 
-	t.Run("eval ratelimit script - at limit", func(t *testing.T) {
-		for i := 0; i < 5; i++ {
-			_, _ = client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey3"}, 5, 3600000).Result()
-		}
-		result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey3"}, 5, 3600000).Result()
-		if err != nil {
-			t.Fatalf("Eval ratelimit error = %v", err)
-		}
-		sl, ok := result.([]interface{})
-		if !ok || len(sl) != 3 {
-			t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
-		}
-		allowed, _ := sl[0].(int64)
-		if allowed != 0 {
-			t.Errorf("Eval ratelimit at limit allowed = %v, want 0", allowed)
-		}
-	})
+	t.Run("eval ratelimit script - at limit", func(t *testing.T) { checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptAtLimit(t, client, ctx) })
 
 	t.Run("eval cooldown script - first call", func(t *testing.T) {
-		result, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey1"}, 60000).Result()
-		if err != nil {
-			t.Fatalf("Eval cooldown error = %v", err)
-		}
-		sl, ok := result.([]interface{})
-		if !ok || len(sl) != 2 {
-			t.Errorf("Eval cooldown result = %v, want 2 elements", result)
-		}
+		checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptFirstCall(t, client, ctx)
 	})
 
 	t.Run("eval cooldown script - during cooldown", func(t *testing.T) {
-		_, _ = client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey2"}, 60000).Result()
-		result, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey2"}, 60000).Result()
-		if err != nil {
-			t.Fatalf("Eval cooldown error = %v", err)
-		}
-		sl, ok := result.([]interface{})
-		if !ok || len(sl) != 2 {
-			t.Errorf("Eval cooldown result = %v, want 2 elements", result)
-		}
-		allowed, _ := sl[0].(int64)
-		if allowed != 0 {
-			t.Errorf("Eval cooldown during cooldown allowed = %v, want 0", allowed)
-		}
+		checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptDuringCooldown(t, client, ctx)
 	})
 
 	t.Run("eval ratelimit script - invalid args", func(t *testing.T) {
-		_, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:x"}, 10).Result()
-		if err == nil {
-			t.Error("Eval ratelimit with only 1 argv should return error")
-		}
+		checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptInvalidArgs(t, client, ctx)
 	})
 
 	t.Run("eval cooldown script - invalid args", func(t *testing.T) {
-		_, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:x"}).Result()
-		if err == nil {
-			t.Error("Eval cooldown with no argv should return error")
-		}
+		checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptInvalidArgs(t, client, ctx)
 	})
 }
 
@@ -938,4 +880,107 @@ func TestReadLineTrimsCRLF(t *testing.T) {
 	if line != "hello" {
 		t.Errorf("readLine() = %q, want %q", line, "hello")
 	}
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptNewKey(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey1"}, 10, 3600000).Result()
+	if err != nil {
+		t.Fatalf("Eval ratelimit error = %v", err)
+	}
+	sl, ok := result.([]interface{})
+	if !ok || len(sl) != 3 {
+		t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptExistingKeyUnderLimit(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	_, _ = client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey2"}, 10, 3600000).Result()
+	result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey2"}, 10, 3600000).Result()
+	if err != nil {
+		t.Fatalf("Eval ratelimit error = %v", err)
+	}
+	sl, ok := result.([]interface{})
+	if !ok || len(sl) != 3 {
+		t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptAtLimit(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	for i := 0; i < 5; i++ {
+		_, _ = client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey3"}, 5, 3600000).Result()
+	}
+	result, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:rlkey3"}, 5, 3600000).Result()
+	if err != nil {
+		t.Fatalf("Eval ratelimit error = %v", err)
+	}
+	sl, ok := result.([]interface{})
+	if !ok || len(sl) != 3 {
+		t.Errorf("Eval ratelimit result = %v, want 3 elements", result)
+	}
+	allowed, _ := sl[0].(int64)
+	if allowed != 0 {
+		t.Errorf("Eval ratelimit at limit allowed = %v, want 0", allowed)
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptFirstCall(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	result, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey1"}, 60000).Result()
+	if err != nil {
+		t.Fatalf("Eval cooldown error = %v", err)
+	}
+	sl, ok := result.([]interface{})
+	if !ok || len(sl) != 2 {
+		t.Errorf("Eval cooldown result = %v, want 2 elements", result)
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptDuringCooldown(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	_, _ = client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey2"}, 60000).Result()
+	result, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:cdkey2"}, 60000).Result()
+	if err != nil {
+		t.Fatalf("Eval cooldown error = %v", err)
+	}
+	sl, ok := result.([]interface{})
+	if !ok || len(sl) != 2 {
+		t.Errorf("Eval cooldown result = %v, want 2 elements", result)
+	}
+	allowed, _ := sl[0].(int64)
+	if allowed != 0 {
+		t.Errorf("Eval cooldown during cooldown allowed = %v, want 0", allowed)
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalRatelimitScriptInvalidArgs(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	_, err := client.Eval(ctx, rateLimitScriptMarker, []string{"ratelimit:x"}, 10).Result()
+	if err == nil {
+		t.Error("Eval ratelimit with only 1 argv should return error")
+	}
+
+}
+
+func checkMockRedis_Eval_RateLimitAndCooldownEvalCooldownScriptInvalidArgs(t *testing.T, client *redis.Client, ctx context.Context) {
+	t.Helper()
+
+	_, err := client.Eval(ctx, cooldownScriptMarker, []string{"ratelimit:cooldown:x"}).Result()
+	if err == nil {
+		t.Error("Eval cooldown with no argv should return error")
+	}
+
 }

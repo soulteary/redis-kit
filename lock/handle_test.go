@@ -374,110 +374,11 @@ func TestHandleErrorsPreserveCallerCancellation(t *testing.T) {
 // Reporting success at that point lets the caller enter a critical section
 // after the key may already have expired and been acquired elsewhere.
 func TestLockOperationsRejectRepliesAfterDeadline(t *testing.T) {
-	t.Run("Acquire", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	t.Run("Acquire", checkLockOperationsRejectRepliesAfterDeadlineAcquire)
 
-		hook := newCommandQueueDelayHook("set", "")
-		client.AddHook(hook)
-		locker := NewRedisLocker(client)
-		type result struct {
-			handle *Handle
-			err    error
-		}
-		done := make(chan result, 1)
-		go func() {
-			h, err := locker.Acquire(context.Background(), "late-acquire", 100*time.Millisecond)
-			done <- result{handle: h, err: err}
-		}()
+	t.Run("Extend", checkLockOperationsRejectRepliesAfterDeadlineExtend)
 
-		select {
-		case <-hook.processed:
-		case <-time.After(2 * time.Second):
-			close(hook.unblock)
-			t.Fatal("Acquire did not reach the delayed-reply window")
-		}
-		time.Sleep(120 * time.Millisecond)
-		close(hook.unblock)
-		got := <-done
-		if got.handle != nil || !errors.Is(got.err, ErrLockExpired) {
-			t.Errorf("Acquire after its deadline = (%v, %v), want (nil, ErrLockExpired)", got.handle, got.err)
-		}
-		if _, err := client.Get(context.Background(), "late-acquire").Result(); !errors.Is(err, redis.Nil) {
-			t.Errorf("rejected Acquire left its token in Redis: %v", err)
-		}
-	})
-
-	t.Run("Extend", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		locker := NewRedisLocker(client)
-		h, err := locker.Acquire(context.Background(), "late-extend", time.Minute)
-		if err != nil || h == nil {
-			t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
-		}
-		previous := h.ExpiresAt()
-		hook := newCommandQueueDelayHook("eval", "redis-kit:lock-extend")
-		client.AddHook(hook)
-		done := make(chan error, 1)
-		go func() { done <- h.Extend(context.Background(), 100*time.Millisecond) }()
-
-		select {
-		case <-hook.processed:
-		case <-time.After(2 * time.Second):
-			close(hook.unblock)
-			t.Fatal("Extend did not reach the delayed-reply window")
-		}
-		time.Sleep(120 * time.Millisecond)
-		close(hook.unblock)
-		if err := <-done; !errors.Is(err, ErrLockExpired) {
-			t.Errorf("Extend after its deadline = %v, want ErrLockExpired", err)
-		}
-		if got := h.ExpiresAt(); !got.Equal(previous) {
-			t.Errorf("late Extend published deadline %s, want previous %s", got, previous)
-		}
-		if _, err := client.Get(context.Background(), "late-extend").Result(); !errors.Is(err, redis.Nil) {
-			t.Errorf("rejected Extend left its renewed token in Redis: %v", err)
-		}
-	})
-
-	t.Run("legacy Lock", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		hook := newCommandQueueDelayHook("set", "")
-		client.AddHook(hook)
-		locker := NewRedisLockerWithLockTime(client, 100*time.Millisecond)
-		type result struct {
-			ok  bool
-			err error
-		}
-		done := make(chan result, 1)
-		go func() {
-			ok, err := locker.Lock("late-legacy")
-			done <- result{ok: ok, err: err}
-		}()
-
-		select {
-		case <-hook.processed:
-		case <-time.After(2 * time.Second):
-			close(hook.unblock)
-			t.Fatal("Lock did not reach the delayed-reply window")
-		}
-		time.Sleep(120 * time.Millisecond)
-		close(hook.unblock)
-		got := <-done
-		if got.ok || !errors.Is(got.err, ErrLockExpired) {
-			t.Errorf("Lock after its deadline = (%v, %v), want (false, ErrLockExpired)", got.ok, got.err)
-		}
-		if outstanding := locker.outstanding("late-legacy"); outstanding != 0 {
-			t.Errorf("late Lock recorded %d outstanding acquisition(s), want 0", outstanding)
-		}
-		if _, err := client.Get(context.Background(), "late-legacy").Result(); !errors.Is(err, redis.Nil) {
-			t.Errorf("rejected Lock left its token in Redis: %v", err)
-		}
-	})
+	t.Run("legacy Lock", checkLockOperationsRejectRepliesAfterDeadlineLegacyLock)
 }
 
 // TestReleaseWaitsForInFlightExtend is the regression test for Release racing
@@ -813,4 +714,118 @@ func TestRoundUpMillisSaturates(t *testing.T) {
 	if got := roundUpMillis(2 * time.Millisecond); got != 2*time.Millisecond {
 		t.Errorf("roundUpMillis(2ms) = %s, want it unchanged", got)
 	}
+}
+
+func checkLockOperationsRejectRepliesAfterDeadlineAcquire(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	hook := newCommandQueueDelayHook("set", "")
+	client.AddHook(hook)
+	locker := NewRedisLocker(client)
+	type result struct {
+		handle *Handle
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		h, err := locker.Acquire(context.Background(), "late-acquire", 100*time.Millisecond)
+		done <- result{handle: h, err: err}
+	}()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Acquire did not reach the delayed-reply window")
+	}
+	time.Sleep(120 * time.Millisecond)
+	close(hook.unblock)
+	got := <-done
+	if got.handle != nil || !errors.Is(got.err, ErrLockExpired) {
+		t.Errorf("Acquire after its deadline = (%v, %v), want (nil, ErrLockExpired)", got.handle, got.err)
+	}
+	if _, err := client.Get(context.Background(), "late-acquire").Result(); !errors.Is(err, redis.Nil) {
+		t.Errorf("rejected Acquire left its token in Redis: %v", err)
+	}
+
+}
+
+func checkLockOperationsRejectRepliesAfterDeadlineExtend(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	locker := NewRedisLocker(client)
+	h, err := locker.Acquire(context.Background(), "late-extend", time.Minute)
+	if err != nil || h == nil {
+		t.Fatalf("Acquire = (%v, %v), want a handle", h, err)
+	}
+	previous := h.ExpiresAt()
+	hook := newCommandQueueDelayHook("eval", "redis-kit:lock-extend")
+	client.AddHook(hook)
+	done := make(chan error, 1)
+	go func() { done <- h.Extend(context.Background(), 100*time.Millisecond) }()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Extend did not reach the delayed-reply window")
+	}
+	time.Sleep(120 * time.Millisecond)
+	close(hook.unblock)
+	if err := <-done; !errors.Is(err, ErrLockExpired) {
+		t.Errorf("Extend after its deadline = %v, want ErrLockExpired", err)
+	}
+	if got := h.ExpiresAt(); !got.Equal(previous) {
+		t.Errorf("late Extend published deadline %s, want previous %s", got, previous)
+	}
+	if _, err := client.Get(context.Background(), "late-extend").Result(); !errors.Is(err, redis.Nil) {
+		t.Errorf("rejected Extend left its renewed token in Redis: %v", err)
+	}
+
+}
+
+func checkLockOperationsRejectRepliesAfterDeadlineLegacyLock(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	hook := newCommandQueueDelayHook("set", "")
+	client.AddHook(hook)
+	locker := NewRedisLockerWithLockTime(client, 100*time.Millisecond)
+	type result struct {
+		ok  bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ok, err := locker.Lock("late-legacy")
+		done <- result{ok: ok, err: err}
+	}()
+
+	select {
+	case <-hook.processed:
+	case <-time.After(2 * time.Second):
+		close(hook.unblock)
+		t.Fatal("Lock did not reach the delayed-reply window")
+	}
+	time.Sleep(120 * time.Millisecond)
+	close(hook.unblock)
+	got := <-done
+	if got.ok || !errors.Is(got.err, ErrLockExpired) {
+		t.Errorf("Lock after its deadline = (%v, %v), want (false, ErrLockExpired)", got.ok, got.err)
+	}
+	if outstanding := locker.outstanding("late-legacy"); outstanding != 0 {
+		t.Errorf("late Lock recorded %d outstanding acquisition(s), want 0", outstanding)
+	}
+	if _, err := client.Get(context.Background(), "late-legacy").Result(); !errors.Is(err, redis.Nil) {
+		t.Errorf("rejected Lock left its token in Redis: %v", err)
+	}
+
 }

@@ -348,134 +348,20 @@ func (m *MockRedis) handleEval(args []string, w *bufio.Writer) error {
 
 	// Handle the extend script: if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end
 	if strings.Contains(script, "redis-kit:lock-extend") {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		if len(argv) < 2 {
-			return writeError(w, "invalid args")
-		}
-		ttlMs, err := strconv.ParseInt(argv[1], 10, 64)
-		if err != nil {
-			return writeError(w, "invalid ttl")
-		}
-		val, ok := m.data[key]
-		if !ok || val.value != argv[0] {
-			return writeInt(w, 0)
-		}
-		if val.expiresAt != nil && time.Now().After(*val.expiresAt) {
-			delete(m.data, key)
-			return writeInt(w, 0)
-		}
-		exp := time.Now().Add(time.Duration(ttlMs) * time.Millisecond)
-		val.expiresAt = &exp
-		m.data[key] = val
-		return writeInt(w, 1)
+		return m.evalExtend(key, argv, w)
 	}
 
 	// Handle the unlock script: if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end
 	if strings.Contains(script, "get") && strings.Contains(script, "del") {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		if len(argv) < 1 {
-			return writeError(w, "invalid args")
-		}
-		lockValue := argv[0]
-		val, ok := m.data[key]
-		if !ok {
-			return writeInt(w, 0)
-		}
-
-		if val.value == lockValue {
-			delete(m.data, key)
-			return writeInt(w, 1)
-		}
-
-		return writeInt(w, 0)
+		return m.evalUnlock(key, argv, w)
 	}
 
 	if strings.Contains(script, "redis-kit:ratelimit") {
-		if len(argv) < 2 {
-			return writeError(w, "invalid args")
-		}
-		limit, err := strconv.ParseInt(argv[0], 10, 64)
-		if err != nil {
-			return writeError(w, "invalid limit")
-		}
-		windowMs, err := strconv.ParseInt(argv[1], 10, 64)
-		if err != nil {
-			return writeError(w, "invalid window")
-		}
-
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		val, ok := m.data[key]
-		if ok && val.expiresAt != nil && time.Now().After(*val.expiresAt) {
-			delete(m.data, key)
-			ok = false
-		}
-
-		if !ok {
-			exp := time.Now().Add(time.Duration(windowMs) * time.Millisecond)
-			m.data[key] = mockValue{value: "1", expiresAt: &exp}
-			remaining := limit - 1
-			if remaining < 0 {
-				remaining = 0
-			}
-			return writeArrayInt(w, []int64{1, remaining, windowMs})
-		}
-
-		current, err := strconv.ParseInt(val.value, 10, 64)
-		if err != nil {
-			return writeError(w, "value is not an integer")
-		}
-		if current >= limit {
-			ttl := ttlMilliseconds(val.expiresAt)
-			return writeArrayInt(w, []int64{0, 0, ttl})
-		}
-
-		current++
-		if val.expiresAt == nil {
-			exp := time.Now().Add(time.Duration(windowMs) * time.Millisecond)
-			val.expiresAt = &exp
-		}
-		val.value = strconv.FormatInt(current, 10)
-		m.data[key] = val
-		remaining := limit - current
-		if remaining < 0 {
-			remaining = 0
-		}
-		ttl := ttlMilliseconds(val.expiresAt)
-		return writeArrayInt(w, []int64{1, remaining, ttl})
+		return m.evalRateLimit(key, argv, w)
 	}
 
 	if strings.Contains(script, "redis-kit:cooldown") {
-		if len(argv) < 1 {
-			return writeError(w, "invalid args")
-		}
-		cooldownMs, err := strconv.ParseInt(argv[0], 10, 64)
-		if err != nil {
-			return writeError(w, "invalid cooldown")
-		}
-
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		val, ok := m.data[key]
-		if ok && val.expiresAt != nil && time.Now().After(*val.expiresAt) {
-			delete(m.data, key)
-			ok = false
-		}
-
-		if !ok {
-			exp := time.Now().Add(time.Duration(cooldownMs) * time.Millisecond)
-			m.data[key] = mockValue{value: "1", expiresAt: &exp}
-			return writeArrayInt(w, []int64{1, cooldownMs})
-		}
-
-		ttl := ttlMilliseconds(val.expiresAt)
-		return writeArrayInt(w, []int64{0, ttl})
+		return m.evalCooldown(key, argv, w)
 	}
 
 	return writeError(w, "unsupported script")
@@ -594,4 +480,138 @@ func ttlMilliseconds(expiresAt *time.Time) int64 {
 		return -2
 	}
 	return int64(ttl / time.Millisecond)
+}
+
+func (m *MockRedis) evalExtend(key string, argv []string, w *bufio.Writer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(argv) < 2 {
+		return writeError(w, "invalid args")
+	}
+	ttlMs, err := strconv.ParseInt(argv[1], 10, 64)
+	if err != nil {
+		return writeError(w, "invalid ttl")
+	}
+	val, ok := m.data[key]
+	if !ok || val.value != argv[0] {
+		return writeInt(w, 0)
+	}
+	if val.expiresAt != nil && time.Now().After(*val.expiresAt) {
+		delete(m.data, key)
+		return writeInt(w, 0)
+	}
+	exp := time.Now().Add(time.Duration(ttlMs) * time.Millisecond)
+	val.expiresAt = &exp
+	m.data[key] = val
+	return writeInt(w, 1)
+
+}
+
+func (m *MockRedis) evalUnlock(key string, argv []string, w *bufio.Writer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(argv) < 1 {
+		return writeError(w, "invalid args")
+	}
+	lockValue := argv[0]
+	val, ok := m.data[key]
+	if !ok {
+		return writeInt(w, 0)
+	}
+
+	if val.value == lockValue {
+		delete(m.data, key)
+		return writeInt(w, 1)
+	}
+
+	return writeInt(w, 0)
+
+}
+
+func (m *MockRedis) evalRateLimit(key string, argv []string, w *bufio.Writer) error {
+	if len(argv) < 2 {
+		return writeError(w, "invalid args")
+	}
+	limit, err := strconv.ParseInt(argv[0], 10, 64)
+	if err != nil {
+		return writeError(w, "invalid limit")
+	}
+	windowMs, err := strconv.ParseInt(argv[1], 10, 64)
+	if err != nil {
+		return writeError(w, "invalid window")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	val, ok := m.data[key]
+	if ok && val.expiresAt != nil && time.Now().After(*val.expiresAt) {
+		delete(m.data, key)
+		ok = false
+	}
+
+	if !ok {
+		exp := time.Now().Add(time.Duration(windowMs) * time.Millisecond)
+		m.data[key] = mockValue{value: "1", expiresAt: &exp}
+		remaining := limit - 1
+		if remaining < 0 {
+			remaining = 0
+		}
+		return writeArrayInt(w, []int64{1, remaining, windowMs})
+	}
+
+	current, err := strconv.ParseInt(val.value, 10, 64)
+	if err != nil {
+		return writeError(w, "value is not an integer")
+	}
+	if current >= limit {
+		ttl := ttlMilliseconds(val.expiresAt)
+		return writeArrayInt(w, []int64{0, 0, ttl})
+	}
+
+	current++
+	if val.expiresAt == nil {
+		exp := time.Now().Add(time.Duration(windowMs) * time.Millisecond)
+		val.expiresAt = &exp
+	}
+	val.value = strconv.FormatInt(current, 10)
+	m.data[key] = val
+	remaining := limit - current
+	if remaining < 0 {
+		remaining = 0
+	}
+	ttl := ttlMilliseconds(val.expiresAt)
+	return writeArrayInt(w, []int64{1, remaining, ttl})
+
+}
+
+func (m *MockRedis) evalCooldown(key string, argv []string, w *bufio.Writer) error {
+	if len(argv) < 1 {
+		return writeError(w, "invalid args")
+	}
+	cooldownMs, err := strconv.ParseInt(argv[0], 10, 64)
+	if err != nil {
+		return writeError(w, "invalid cooldown")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	val, ok := m.data[key]
+	if ok && val.expiresAt != nil && time.Now().After(*val.expiresAt) {
+		delete(m.data, key)
+		ok = false
+	}
+
+	if !ok {
+		exp := time.Now().Add(time.Duration(cooldownMs) * time.Millisecond)
+		m.data[key] = mockValue{value: "1", expiresAt: &exp}
+		return writeArrayInt(w, []int64{1, cooldownMs})
+	}
+
+	ttl := ttlMilliseconds(val.expiresAt)
+	return writeArrayInt(w, []int64{0, ttl})
+
 }

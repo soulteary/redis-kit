@@ -543,82 +543,7 @@ func NewHybridLockerWithLocalFallback(client redis.UniversalClient) *HybridLocke
 // process-local lock instead.
 func (h *HybridLocker) Lock(key string) (bool, error) {
 	if h.fallbackActive() {
-		// Held for this key's whole decision, Redis call included. A key already
-		// held through the local fallback must not be handed out again via
-		// Redis the moment Redis recovers: that puts two holders in the
-		// critical section, and the local holder's Unlock then goes on to
-		// consume the Redis holder's token. Unrelated keys use independent
-		// entries and do not queue behind this network call.
-		releaseDecision := h.fallbackMu.lock(key)
-		defer releaseDecision()
-
-		switch c := h.counts(key); {
-		case c.local > 0:
-			// A local fallback is outstanding. Do not hand the key out
-			// through Redis: that is a second holder in the same critical
-			// section. The local locker refuses it, which is the answer.
-			return h.localLocker.Lock(key)
-
-		case c.redis > 0:
-			// A Redis acquisition is outstanding. Never degrade to the local
-			// lock for THIS key, even now that Redis is unreachable -- that
-			// holder is still running. Refusing costs availability for one
-			// key; degrading would put two callers inside it.
-			success, err := h.redisLocker.Lock(key)
-			if err == nil {
-				if success {
-					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
-				}
-				return success, nil
-			}
-			var uncertain *uncertainLeaseError
-			if errors.As(err, &uncertain) {
-				h.markUncertain(key, uncertain.until)
-			}
-			return false, err
-
-		case !c.uncertainUntil.IsZero():
-			return false, fmt.Errorf("%w: Redis ownership of %q remains uncertain until %s", ErrRedisUnavailable, key, c.uncertainUntil)
-
-		default:
-			success, err := h.redisLocker.Lock(key)
-			if err == nil {
-				if success {
-					h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
-				}
-				return success, nil
-			}
-			// Only an unavailable Redis activates the explicit fallback. A
-			// definitive error such as an acquisition reply arriving after its
-			// lease deadline must be reported, not converted into a local grant.
-			// Test expiration first: failed cleanup of a late lease deliberately
-			// matches BOTH sentinels, and its uncertain Redis lock makes local
-			// fallback especially unsafe.
-			if errors.Is(err, ErrLockExpired) {
-				var uncertain *uncertainLeaseError
-				if errors.As(err, &uncertain) {
-					h.markUncertain(key, uncertain.until)
-				}
-				return false, err
-			}
-			if !errors.Is(err, ErrRedisUnavailable) {
-				return false, err
-			}
-			if c.redisExpired > 0 {
-				// Unlock identifies only a key, not its caller. If a local holder
-				// were admitted while an older Redis route remained, either
-				// caller's single Unlock could be mistaken for the other. Fail
-				// closed until the expired route is consumed; token-bearing Handle
-				// acquisitions do not have this ambiguity.
-				return false, fmt.Errorf("%w: %d expired Redis acquisition(s) for %q still await Unlock", ErrLockExpired, c.redisExpired, key)
-			}
-			// Explicitly opted in: mutual exclusion across instances is now lost.
-			success, err = h.localLocker.Lock(key)
-			if success && err == nil {
-				h.acquired(key, false, time.Time{})
-			}
-			return success, err
-		}
+		return h.lockWithFallback(key)
 	}
 
 	if h.redisLocker != nil {
@@ -806,4 +731,89 @@ func (k *keyedMutex) lock(key string) func() {
 		}
 		k.mu.Unlock()
 	}
+}
+
+func (h *HybridLocker) lockWithFallback(key string) (bool, error) {
+	// Held for this key's whole decision, Redis call included. A key already
+	// held through the local fallback must not be handed out again via
+	// Redis the moment Redis recovers: that puts two holders in the
+	// critical section, and the local holder's Unlock then goes on to
+	// consume the Redis holder's token. Unrelated keys use independent
+	// entries and do not queue behind this network call.
+	releaseDecision := h.fallbackMu.lock(key)
+	defer releaseDecision()
+
+	switch c := h.counts(key); {
+	case c.local > 0:
+		// A local fallback is outstanding. Do not hand the key out
+		// through Redis: that is a second holder in the same critical
+		// section. The local locker refuses it, which is the answer.
+		return h.localLocker.Lock(key)
+
+	case c.redis > 0:
+		return h.lockExistingRedis(key)
+
+	case !c.uncertainUntil.IsZero():
+		return false, fmt.Errorf("%w: Redis ownership of %q remains uncertain until %s", ErrRedisUnavailable, key, c.uncertainUntil)
+
+	default:
+		success, err := h.redisLocker.Lock(key)
+		if err == nil {
+			if success {
+				h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
+			}
+			return success, nil
+		}
+		// Only an unavailable Redis activates the explicit fallback. A
+		// definitive error such as an acquisition reply arriving after its
+		// lease deadline must be reported, not converted into a local grant.
+		// Test expiration first: failed cleanup of a late lease deliberately
+		// matches BOTH sentinels, and its uncertain Redis lock makes local
+		// fallback especially unsafe.
+		if errors.Is(err, ErrLockExpired) {
+			var uncertain *uncertainLeaseError
+			if errors.As(err, &uncertain) {
+				h.markUncertain(key, uncertain.until)
+			}
+			return false, err
+		}
+		if !errors.Is(err, ErrRedisUnavailable) {
+			return false, err
+		}
+		if c.redisExpired > 0 {
+			// Unlock identifies only a key, not its caller. If a local holder
+			// were admitted while an older Redis route remained, either
+			// caller's single Unlock could be mistaken for the other. Fail
+			// closed until the expired route is consumed; token-bearing Handle
+			// acquisitions do not have this ambiguity.
+			return false, fmt.Errorf("%w: %d expired Redis acquisition(s) for %q still await Unlock", ErrLockExpired, c.redisExpired, key)
+		}
+		// Explicitly opted in: mutual exclusion across instances is now lost.
+		success, err = h.localLocker.Lock(key)
+		if success && err == nil {
+			h.acquired(key, false, time.Time{})
+		}
+		return success, err
+	}
+}
+
+func (h *HybridLocker) lockExistingRedis(key string) (bool, error) {
+
+	// A Redis acquisition is outstanding. Never degrade to the local
+	// lock for THIS key, even now that Redis is unreachable -- that
+	// holder is still running. Refusing costs availability for one
+	// key; degrading would put two callers inside it.
+	success, err := h.redisLocker.Lock(key)
+	if err == nil {
+		if success {
+			h.acquired(key, true, time.Now().Add(roundUpMillis(h.redisLocker.lockTime)))
+		}
+		return success, nil
+	}
+	var uncertain *uncertainLeaseError
+	if errors.As(err, &uncertain) {
+		h.markUncertain(key, uncertain.until)
+	}
+	return false, err
+
 }

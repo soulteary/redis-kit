@@ -10,98 +10,123 @@ import (
 )
 
 func TestCheckHealth(t *testing.T) {
-	t.Run("healthy status", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	t.Run("healthy status", checkCheckHealthHealthyStatus)
 
-		ctx := context.Background()
-		status := CheckHealth(ctx, client)
+	t.Run("nil client", checkCheckHealthNilClient)
 
-		if !status.Healthy {
-			t.Error("CheckHealth() healthy = false, want true")
-		}
-		if status.Error != nil {
-			t.Errorf("CheckHealth() error = %v, want nil", status.Error)
-		}
-		if status.Latency <= 0 {
-			t.Error("CheckHealth() latency should be positive")
-		}
-		if status.Timestamp.IsZero() {
-			t.Error("CheckHealth() timestamp should be set")
-		}
+	t.Run("ping failure", checkCheckHealthPingFailure)
+
+	t.Run("latency measurement", checkCheckHealthLatencyMeasurement)
+
+	t.Run("timestamp recording", checkCheckHealthTimestampRecording)
+}
+
+func checkCheckHealthHealthyStatus(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	ctx := context.Background()
+	status := CheckHealth(ctx, client)
+
+	if !status.Healthy {
+		t.Error("CheckHealth() healthy = false, want true")
+	}
+	if status.Error != nil {
+		t.Errorf("CheckHealth() error = %v, want nil", status.Error)
+	}
+	if status.Latency <= 0 {
+		t.Error("CheckHealth() latency should be positive")
+	}
+	if status.Timestamp.IsZero() {
+		t.Error("CheckHealth() timestamp should be set")
+	}
+
+}
+
+func checkCheckHealthNilClient(t *testing.T) {
+	t.Helper()
+
+	ctx := context.Background()
+	status := CheckHealth(ctx, nil)
+
+	if status.Healthy {
+		t.Error("CheckHealth() with nil client healthy = true, want false")
+	}
+	if status.Error == nil {
+		t.Error("CheckHealth() with nil client error = nil, want error")
+	}
+	if status.Error.Error() != "redis client is nil" {
+		t.Errorf("CheckHealth() error = %q, want %q", status.Error.Error(), "redis client is nil")
+	}
+	if status.Timestamp.IsZero() {
+		t.Error("CheckHealth() timestamp should be set even on error")
+	}
+
+}
+
+func checkCheckHealthPingFailure(t *testing.T) {
+	t.Helper()
+
+	client := redis.NewClient(&redis.Options{
+		Addr: "invalid:6379",
 	})
+	defer func() { _ = client.Close() }()
 
-	t.Run("nil client", func(t *testing.T) {
-		ctx := context.Background()
-		status := CheckHealth(ctx, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
-		if status.Healthy {
-			t.Error("CheckHealth() with nil client healthy = true, want false")
-		}
-		if status.Error == nil {
-			t.Error("CheckHealth() with nil client error = nil, want error")
-		}
-		if status.Error.Error() != "redis client is nil" {
-			t.Errorf("CheckHealth() error = %q, want %q", status.Error.Error(), "redis client is nil")
-		}
-		if status.Timestamp.IsZero() {
-			t.Error("CheckHealth() timestamp should be set even on error")
-		}
-	})
+	status := CheckHealth(ctx, client)
 
-	t.Run("ping failure", func(t *testing.T) {
-		client := redis.NewClient(&redis.Options{
-			Addr: "invalid:6379",
-		})
-		defer func() { _ = client.Close() }()
+	if status.Healthy {
+		t.Error("CheckHealth() with invalid client healthy = true, want false")
+	}
+	if status.Error == nil {
+		t.Error("CheckHealth() with invalid client error = nil, want error")
+	}
+	if status.Latency <= 0 {
+		t.Error("CheckHealth() latency should be measured even on failure")
+	}
+	if status.Timestamp.IsZero() {
+		t.Error("CheckHealth() timestamp should be set even on error")
+	}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
+}
 
-		status := CheckHealth(ctx, client)
+func checkCheckHealthLatencyMeasurement(t *testing.T) {
+	t.Helper()
 
-		if status.Healthy {
-			t.Error("CheckHealth() with invalid client healthy = true, want false")
-		}
-		if status.Error == nil {
-			t.Error("CheckHealth() with invalid client error = nil, want error")
-		}
-		if status.Latency <= 0 {
-			t.Error("CheckHealth() latency should be measured even on failure")
-		}
-		if status.Timestamp.IsZero() {
-			t.Error("CheckHealth() timestamp should be set even on error")
-		}
-	})
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
 
-	t.Run("latency measurement", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	ctx := context.Background()
+	status := CheckHealth(ctx, client)
 
-		ctx := context.Background()
-		status := CheckHealth(ctx, client)
+	// Latency should be reasonable (less than 1 second for mock)
+	if status.Latency > time.Second {
+		t.Errorf("CheckHealth() latency = %v, should be less than 1s", status.Latency)
+	}
+	if status.Latency <= 0 {
+		t.Error("CheckHealth() latency should be positive")
+	}
 
-		// Latency should be reasonable (less than 1 second for mock)
-		if status.Latency > time.Second {
-			t.Errorf("CheckHealth() latency = %v, should be less than 1s", status.Latency)
-		}
-		if status.Latency <= 0 {
-			t.Error("CheckHealth() latency should be positive")
-		}
-	})
+}
 
-	t.Run("timestamp recording", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+func checkCheckHealthTimestampRecording(t *testing.T) {
+	t.Helper()
 
-		before := time.Now()
-		ctx := context.Background()
-		status := CheckHealth(ctx, client)
-		after := time.Now()
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
 
-		if status.Timestamp.Before(before) || status.Timestamp.After(after) {
-			t.Errorf("CheckHealth() timestamp = %v, should be between %v and %v",
-				status.Timestamp, before, after)
-		}
-	})
+	before := time.Now()
+	ctx := context.Background()
+	status := CheckHealth(ctx, client)
+	after := time.Now()
+
+	if status.Timestamp.Before(before) || status.Timestamp.After(after) {
+		t.Errorf("CheckHealth() timestamp = %v, should be between %v and %v",
+			status.Timestamp, before, after)
+	}
+
 }

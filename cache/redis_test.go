@@ -136,115 +136,15 @@ func TestRedisCache_Set(t *testing.T) {
 }
 
 func TestRedisCache_Get(t *testing.T) {
-	t.Run("successful get", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	t.Run("successful get", checkRedisCache_GetSuccessfulGet)
 
-		c := NewCache(client, "test:")
-		ctx := context.Background()
+	t.Run("key not found", checkRedisCache_GetKeyNotFound)
 
-		// Set first
-		err := c.Set(ctx, "key1", "value1", time.Minute)
-		if err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	t.Run("nil client error", checkRedisCache_GetNilClientError)
 
-		// Get
-		var value string
-		err = c.Get(ctx, "key1", &value)
-		if err != nil {
-			t.Errorf("Get() error = %v, want nil", err)
-		}
-		if value != "value1" {
-			t.Errorf("Get() = %q, want %q", value, "value1")
-		}
-	})
+	t.Run("complex type deserialization", checkRedisCache_GetComplexTypeDeserialization)
 
-	t.Run("key not found", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		var value string
-		err := c.Get(ctx, "nonexistent", &value)
-		if err == nil {
-			t.Error("Get() with non-existent key should return error")
-		}
-		if err.Error() != "key not found: nonexistent" {
-			t.Errorf("Get() error = %q, want %q", err.Error(), "key not found: nonexistent")
-		}
-	})
-
-	t.Run("nil client error", func(t *testing.T) {
-		c := &RedisCache{
-			client:    nil,
-			keyPrefix: "test:",
-		}
-		ctx := context.Background()
-
-		var value string
-		err := c.Get(ctx, "key1", &value)
-		if err == nil {
-			t.Error("Get() with nil client should return error")
-		}
-		if err.Error() != "redis client is nil" {
-			t.Errorf("Get() error = %q, want %q", err.Error(), "redis client is nil")
-		}
-	})
-
-	t.Run("complex type deserialization", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		type User struct {
-			ID   string
-			Name string
-			Age  int
-		}
-
-		original := User{ID: "123", Name: "Alice", Age: 30}
-		err := c.Set(ctx, "user:123", original, time.Minute)
-		if err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		var retrieved User
-		err = c.Get(ctx, "user:123", &retrieved)
-		if err != nil {
-			t.Errorf("Get() error = %v, want nil", err)
-		}
-		if retrieved.ID != original.ID || retrieved.Name != original.Name || retrieved.Age != original.Age {
-			t.Errorf("Get() = %+v, want %+v", retrieved, original)
-		}
-	})
-
-	t.Run("slice deserialization", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		original := []string{"item1", "item2", "item3"}
-		err := c.Set(ctx, "items", original, time.Minute)
-		if err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		var retrieved []string
-		err = c.Get(ctx, "items", &retrieved)
-		if err != nil {
-			t.Errorf("Get() error = %v, want nil", err)
-		}
-		if len(retrieved) != len(original) {
-			t.Errorf("Get() length = %d, want %d", len(retrieved), len(original))
-		}
-	})
+	t.Run("slice deserialization", checkRedisCache_GetSliceDeserialization)
 }
 
 func TestRedisCache_Del(t *testing.T) {
@@ -442,180 +342,19 @@ func TestRedisCache_Expire(t *testing.T) {
 }
 
 func TestRedisCache_KeyPrefix(t *testing.T) {
-	t.Run("prefix is applied", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	t.Run("prefix is applied", checkRedisCache_KeyPrefixPrefixIsApplied)
 
-		c := NewCache(client, "app:")
-		ctx := context.Background()
+	t.Run("different prefixes don't conflict", checkRedisCache_KeyPrefixDifferentPrefixesDonTConflict)
 
-		// Set with prefix
-		err := c.Set(ctx, "key1", "value1", time.Minute)
-		if err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	t.Run("invalid JSON deserialization", checkRedisCache_KeyPrefixInvalidJSONDeserialization)
 
-		// Get should work with same key (prefix handled internally)
-		var value string
-		err = c.Get(ctx, "key1", &value)
-		if err != nil {
-			t.Errorf("Get() error = %v, want nil", err)
-		}
-		if value != "value1" {
-			t.Errorf("Get() = %q, want %q", value, "value1")
-		}
-	})
+	t.Run("zero TTL", checkRedisCache_KeyPrefixZeroTTL)
 
-	t.Run("different prefixes don't conflict", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
+	t.Run("empty value", checkRedisCache_KeyPrefixEmptyValue)
 
-		c1 := NewCache(client, "app1:")
-		c2 := NewCache(client, "app2:")
-		ctx := context.Background()
+	t.Run("nil value handling", checkRedisCache_KeyPrefixNilValueHandling)
 
-		// Set same key in different caches
-		_ = c1.Set(ctx, "key", "value1", time.Minute)
-		_ = c2.Set(ctx, "key", "value2", time.Minute)
-
-		// Get should return different values
-		var v1, v2 string
-		_ = c1.Get(ctx, "key", &v1)
-		_ = c2.Get(ctx, "key", &v2)
-
-		if v1 != "value1" {
-			t.Errorf("c1.Get() = %q, want %q", v1, "value1")
-		}
-		if v2 != "value2" {
-			t.Errorf("c2.Get() = %q, want %q", v2, "value2")
-		}
-	})
-
-	t.Run("invalid JSON deserialization", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		// Set data that can't be unmarshaled to target type
-		// Set a map that doesn't match User structure
-		invalidData := map[string]interface{}{"not": "a user", "missing": "id field"}
-		_ = c.Set(ctx, "invalid", invalidData, time.Minute)
-
-		// Try to get as struct - should fail unmarshaling
-		type User struct {
-			ID string `json:"id"`
-		}
-		var user User
-		err := c.Get(ctx, "invalid", &user)
-		// This might succeed but user.ID will be empty, or it might fail
-		// The important thing is we test the unmarshal path
-		if err != nil {
-			// Error is acceptable - JSON doesn't match structure
-			t.Logf("Get() with mismatched JSON returned error (acceptable): %v", err)
-		}
-	})
-
-	t.Run("zero TTL", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		// Set with zero TTL (no expiration)
-		err := c.Set(ctx, "key1", "value1", 0)
-		if err != nil {
-			t.Errorf("Set() with zero TTL error = %v, want nil", err)
-		}
-
-		// Should still be able to get
-		var value string
-		err = c.Get(ctx, "key1", &value)
-		if err != nil {
-			t.Errorf("Get() after zero TTL Set() error = %v, want nil", err)
-		}
-		if value != "value1" {
-			t.Errorf("Get() = %q, want %q", value, "value1")
-		}
-	})
-
-	t.Run("empty value", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		// Set empty string
-		err := c.Set(ctx, "empty", "", time.Minute)
-		if err != nil {
-			t.Errorf("Set() with empty value error = %v, want nil", err)
-		}
-
-		// Get empty string
-		var value string
-		err = c.Get(ctx, "empty", &value)
-		if err != nil {
-			t.Errorf("Get() empty value error = %v, want nil", err)
-		}
-		if value != "" {
-			t.Errorf("Get() = %q, want empty string", value)
-		}
-	})
-
-	t.Run("nil value handling", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		c := NewCache(client, "test:")
-		ctx := context.Background()
-
-		// Set nil (should serialize to null)
-		var nilValue *string = nil
-		err := c.Set(ctx, "nil", nilValue, time.Minute)
-		if err != nil {
-			t.Errorf("Set() with nil value error = %v, want nil", err)
-		}
-
-		// Get nil
-		var retrieved *string
-		err = c.Get(ctx, "nil", &retrieved)
-		if err != nil {
-			t.Errorf("Get() nil value error = %v, want nil", err)
-		}
-		// Retrieved should be nil
-		if retrieved != nil {
-			t.Errorf("Get() = %v, want nil", retrieved)
-		}
-	})
-
-	t.Run("buildKey edge cases", func(t *testing.T) {
-		client, _ := testutil.NewMockRedisClient()
-		defer func() { _ = client.Close() }()
-
-		// Test with various prefix/key combinations
-		testCases := []struct {
-			prefix string
-			key    string
-			want   string
-		}{
-			{"", "", ""},
-			{"", "key", "key"},
-			{"prefix:", "", "prefix:"},
-			{"prefix:", "key", "prefix:key"},
-			{"a", "b", "ab"},
-		}
-
-		for _, tc := range testCases {
-			c := NewCache(client, tc.prefix)
-			got := c.buildKey(tc.key)
-			if got != tc.want {
-				t.Errorf("buildKey(prefix=%q, key=%q) = %q, want %q", tc.prefix, tc.key, got, tc.want)
-			}
-		}
-	})
+	t.Run("buildKey edge cases", checkRedisCache_KeyPrefixBuildKeyEdgeCases)
 }
 
 // unmarshalableValue is a type that cannot be marshaled to JSON
@@ -843,4 +582,325 @@ func TestGetMissIsClassifiable(t *testing.T) {
 	if err.Error() != "key not found: absent" {
 		t.Errorf("Error() = %q, want %q", err.Error(), "key not found: absent")
 	}
+}
+
+func checkRedisCache_GetSuccessfulGet(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set first
+	err := c.Set(ctx, "key1", "value1", time.Minute)
+	if err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// Get
+	var value string
+	err = c.Get(ctx, "key1", &value)
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if value != "value1" {
+		t.Errorf("Get() = %q, want %q", value, "value1")
+	}
+
+}
+
+func checkRedisCache_GetKeyNotFound(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	var value string
+	err := c.Get(ctx, "nonexistent", &value)
+	if err == nil {
+		t.Error("Get() with non-existent key should return error")
+	}
+	if err.Error() != "key not found: nonexistent" {
+		t.Errorf("Get() error = %q, want %q", err.Error(), "key not found: nonexistent")
+	}
+
+}
+
+func checkRedisCache_GetNilClientError(t *testing.T) {
+	t.Helper()
+
+	c := &RedisCache{
+		client:    nil,
+		keyPrefix: "test:",
+	}
+	ctx := context.Background()
+
+	var value string
+	err := c.Get(ctx, "key1", &value)
+	if err == nil {
+		t.Error("Get() with nil client should return error")
+	}
+	if err.Error() != "redis client is nil" {
+		t.Errorf("Get() error = %q, want %q", err.Error(), "redis client is nil")
+	}
+
+}
+
+func checkRedisCache_GetComplexTypeDeserialization(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	type User struct {
+		ID   string
+		Name string
+		Age  int
+	}
+
+	original := User{ID: "123", Name: "Alice", Age: 30}
+	err := c.Set(ctx, "user:123", original, time.Minute)
+	if err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	var retrieved User
+	err = c.Get(ctx, "user:123", &retrieved)
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if retrieved.ID != original.ID || retrieved.Name != original.Name || retrieved.Age != original.Age {
+		t.Errorf("Get() = %+v, want %+v", retrieved, original)
+	}
+
+}
+
+func checkRedisCache_GetSliceDeserialization(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	original := []string{"item1", "item2", "item3"}
+	err := c.Set(ctx, "items", original, time.Minute)
+	if err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	var retrieved []string
+	err = c.Get(ctx, "items", &retrieved)
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if len(retrieved) != len(original) {
+		t.Errorf("Get() length = %d, want %d", len(retrieved), len(original))
+	}
+
+}
+
+func checkRedisCache_KeyPrefixPrefixIsApplied(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "app:")
+	ctx := context.Background()
+
+	// Set with prefix
+	err := c.Set(ctx, "key1", "value1", time.Minute)
+	if err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	// Get should work with same key (prefix handled internally)
+	var value string
+	err = c.Get(ctx, "key1", &value)
+	if err != nil {
+		t.Errorf("Get() error = %v, want nil", err)
+	}
+	if value != "value1" {
+		t.Errorf("Get() = %q, want %q", value, "value1")
+	}
+
+}
+
+func checkRedisCache_KeyPrefixDifferentPrefixesDonTConflict(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c1 := NewCache(client, "app1:")
+	c2 := NewCache(client, "app2:")
+	ctx := context.Background()
+
+	// Set same key in different caches
+	_ = c1.Set(ctx, "key", "value1", time.Minute)
+	_ = c2.Set(ctx, "key", "value2", time.Minute)
+
+	// Get should return different values
+	var v1, v2 string
+	_ = c1.Get(ctx, "key", &v1)
+	_ = c2.Get(ctx, "key", &v2)
+
+	if v1 != "value1" {
+		t.Errorf("c1.Get() = %q, want %q", v1, "value1")
+	}
+	if v2 != "value2" {
+		t.Errorf("c2.Get() = %q, want %q", v2, "value2")
+	}
+
+}
+
+func checkRedisCache_KeyPrefixInvalidJSONDeserialization(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set data that can't be unmarshaled to target type
+	// Set a map that doesn't match User structure
+	invalidData := map[string]interface{}{"not": "a user", "missing": "id field"}
+	_ = c.Set(ctx, "invalid", invalidData, time.Minute)
+
+	// Try to get as struct - should fail unmarshaling
+	type User struct {
+		ID string `json:"id"`
+	}
+	var user User
+	err := c.Get(ctx, "invalid", &user)
+	// This might succeed but user.ID will be empty, or it might fail
+	// The important thing is we test the unmarshal path
+	if err != nil {
+		// Error is acceptable - JSON doesn't match structure
+		t.Logf("Get() with mismatched JSON returned error (acceptable): %v", err)
+	}
+
+}
+
+func checkRedisCache_KeyPrefixZeroTTL(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set with zero TTL (no expiration)
+	err := c.Set(ctx, "key1", "value1", 0)
+	if err != nil {
+		t.Errorf("Set() with zero TTL error = %v, want nil", err)
+	}
+
+	// Should still be able to get
+	var value string
+	err = c.Get(ctx, "key1", &value)
+	if err != nil {
+		t.Errorf("Get() after zero TTL Set() error = %v, want nil", err)
+	}
+	if value != "value1" {
+		t.Errorf("Get() = %q, want %q", value, "value1")
+	}
+
+}
+
+func checkRedisCache_KeyPrefixEmptyValue(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set empty string
+	err := c.Set(ctx, "empty", "", time.Minute)
+	if err != nil {
+		t.Errorf("Set() with empty value error = %v, want nil", err)
+	}
+
+	// Get empty string
+	var value string
+	err = c.Get(ctx, "empty", &value)
+	if err != nil {
+		t.Errorf("Get() empty value error = %v, want nil", err)
+	}
+	if value != "" {
+		t.Errorf("Get() = %q, want empty string", value)
+	}
+
+}
+
+func checkRedisCache_KeyPrefixNilValueHandling(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	c := NewCache(client, "test:")
+	ctx := context.Background()
+
+	// Set nil (should serialize to null)
+	var nilValue *string = nil
+	err := c.Set(ctx, "nil", nilValue, time.Minute)
+	if err != nil {
+		t.Errorf("Set() with nil value error = %v, want nil", err)
+	}
+
+	// Get nil
+	var retrieved *string
+	err = c.Get(ctx, "nil", &retrieved)
+	if err != nil {
+		t.Errorf("Get() nil value error = %v, want nil", err)
+	}
+	// Retrieved should be nil
+	if retrieved != nil {
+		t.Errorf("Get() = %v, want nil", retrieved)
+	}
+
+}
+
+func checkRedisCache_KeyPrefixBuildKeyEdgeCases(t *testing.T) {
+	t.Helper()
+
+	client, _ := testutil.NewMockRedisClient()
+	defer func() { _ = client.Close() }()
+
+	// Test with various prefix/key combinations
+	testCases := []struct {
+		prefix string
+		key    string
+		want   string
+	}{
+		{"", "", ""},
+		{"", "key", "key"},
+		{"prefix:", "", "prefix:"},
+		{"prefix:", "key", "prefix:key"},
+		{"a", "b", "ab"},
+	}
+
+	for _, tc := range testCases {
+		c := NewCache(client, tc.prefix)
+		got := c.buildKey(tc.key)
+		if got != tc.want {
+			t.Errorf("buildKey(prefix=%q, key=%q) = %q, want %q", tc.prefix, tc.key, got, tc.want)
+		}
+	}
+
 }
