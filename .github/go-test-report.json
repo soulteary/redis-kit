@@ -7,9 +7,9 @@
     "skipped": 0
   },
   "coverage": {
-    "covered_statements": 857,
-    "total_statements": 953,
-    "percentage": 89.93,
+    "covered_statements": 861,
+    "total_statements": 959,
+    "percentage": 89.78,
     "threshold": 0
   },
   "packages": [
@@ -32,7 +32,7 @@
       "status": "pass",
       "tests": 34,
       "failed": 0,
-      "coverage": 98.62
+      "coverage": 97.93
     },
     {
       "name": "internal/nilcheck",
@@ -46,7 +46,7 @@
       "status": "pass",
       "tests": 46,
       "failed": 0,
-      "coverage": 90.93
+      "coverage": 90.99
     },
     {
       "name": "ratelimit",
@@ -60,7 +60,7 @@
       "status": "pass",
       "tests": 27,
       "failed": 0,
-      "coverage": 83.69
+      "coverage": 83.59
     },
     {
       "name": "utils",
