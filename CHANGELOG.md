@@ -10,6 +10,23 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-11-01
+
+### Changed
+
+- Split hybrid-lock fallback decisions and mock Redis Lua operations into
+  smaller helpers while preserving ownership, expiry and per-key serialization.
+- Split independent test cases into named helpers without removing assertions.
+- Update pinned Go test report and Go Report Card tools to v1.1.3 and v1.1.4.
+
+### Quality
+
+- Resolve all reported complexity findings; the regenerated Go Report Card is
+  A+ (100%) with no affected files.
+- Verify the complete suite with the race detector, go vet and golangci-lint.
+
+The public API, module path and dependency versions remain unchanged.
+
 ## [1.8.0] — 2026-10-25
 
 ### Added
