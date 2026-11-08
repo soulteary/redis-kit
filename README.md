@@ -210,8 +210,10 @@ if err := handle.Extend(ctx, 30*time.Second); err != nil {
 }
 ```
 
-Without `Extend` the TTL is fixed at `lock.DefaultLockTime` (15s) and work that
-outlives the lease simply loses the lock, with no error anywhere.
+Without `Extend`, the lease expires after the TTL selected for that acquisition
+(`30s` above). Legacy `Lock` uses the locker's configured duration, whose default
+is `lock.DefaultLockTime` (15s). Expiry does not asynchronously stop protected
+work. Treat it as loss of ownership and check errors from renewal/release calls.
 
 #### Lock errors
 
