@@ -203,8 +203,9 @@ if err := handle.Extend(ctx, 30*time.Second); err != nil {
 }
 ```
 
-没有 `Extend` 时，TTL 固定为 `lock.DefaultLockTime`（15 秒），超过租约的工作会直接丢掉
-锁，而且任何地方都不会报错。
+没有 `Extend` 时，租约在本次获取所选的 TTL（上例为 `30s`）之后到期。旧式 `Lock`
+使用 locker 配置的时长，默认是 `lock.DefaultLockTime`（15 秒）。到期不会异步停止受保护
+的工作；应将其视为失去所有权，并检查续期及释放调用的错误。
 
 #### 锁相关错误
 

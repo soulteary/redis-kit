@@ -12,12 +12,10 @@ import (
 	"github.com/soulteary/redis-kit/internal/nilcheck"
 )
 
-// ErrKeyNotFound is returned by Get when the key is absent or has expired.
+// ErrKeyNotFound identifies a Get miss when the key is absent or has expired.
 //
-// It wraps redis.Nil, so both errors.Is(err, cache.ErrKeyNotFound) and
-// errors.Is(err, redis.Nil) classify a miss. Without a sentinel, callers had no
-// way to tell a miss from a backend failure except by matching on the error
-// text -- which is exactly what downstream code ended up doing.
+// The error returned by Get matches both ErrKeyNotFound and redis.Nil through
+// errors.Is. ErrKeyNotFound itself is a plain sentinel; it does not wrap redis.Nil.
 var ErrKeyNotFound = errors.New("key not found")
 
 // notFoundError reports a cache miss. It keeps the original
