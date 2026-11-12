@@ -10,6 +10,19 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+## [1.8.2] — 2026-11-13
+
+### Changed
+
+- Require Go 1.27.4, which carries security fixes to cgo, the go command, the
+  compiler, the linker and `net/http`.
+
+### Documentation
+
+- Clarify the lock lease and cache miss contracts.
+
+The module path and the public API are unchanged.
+
 ## [1.8.1] — 2026-11-01
 
 ### Changed
