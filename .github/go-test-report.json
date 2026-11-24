@@ -7,9 +7,9 @@
     "skipped": 0
   },
   "coverage": {
-    "covered_statements": 861,
+    "covered_statements": 863,
     "total_statements": 959,
-    "percentage": 89.78,
+    "percentage": 89.99,
     "threshold": 0
   },
   "packages": [
@@ -32,7 +32,7 @@
       "status": "pass",
       "tests": 34,
       "failed": 0,
-      "coverage": 97.93
+      "coverage": 99.31
     },
     {
       "name": "internal/nilcheck",
