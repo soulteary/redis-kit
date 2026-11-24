@@ -10,6 +10,19 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-11-25
+
+### Changed
+
+- Update `github.com/redis/go-redis/v9` from v9.23.0 to v9.24.0.
+
+The Redis client, cache, lock and rate-limit helpers use the updated client dependency.
+
+See the [release notes](docs/releases/v1.8.4.md) for Redis client behavior
+changes and upgrade and rollback guidance.
+
+## [1.8.3] - 2026-11-24
+
 ### Changed
 
 - Update `golang.org/x/sys` from v0.49.0 to v0.50.0.
