@@ -10,6 +10,10 @@ change the module path. It has not happened yet: the module path is still
 
 ## [Unreleased]
 
+### Changed
+
+- Update `golang.org/x/sys` from v0.49.0 to v0.50.0.
+
 ## [1.8.2] — 2026-11-13
 
 ### Changed
